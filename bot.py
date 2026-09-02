@@ -4553,8 +4553,12 @@ async def cmd_slowmoving(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("📭 Inventory is empty. Run /refresh first.")
             return
 
-        # Filter inventory to exclude on-hold warehouses before grouping
-        filtered_inv = [r for r in inventory if r["whs_name"] not in ON_HOLD_WAREHOUSES]
+        # Filter inventory to exclude on-hold and FA warehouses before grouping
+        # FA Warehouse code is WDR12A
+        filtered_inv = [
+            r for r in inventory 
+            if r["whs_name"] not in ON_HOLD_WAREHOUSES and r.get("whs_code") != "WDR12A"
+        ]
         by_item = group_inventory_by_item(filtered_inv)
         items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
         
