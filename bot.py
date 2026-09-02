@@ -4553,7 +4553,9 @@ async def cmd_slowmoving(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("📭 Inventory is empty. Run /refresh first.")
             return
 
-        by_item = group_inventory_by_item(inventory)
+        # Filter inventory to exclude on-hold warehouses before grouping
+        filtered_inv = [r for r in inventory if r["whs_name"] not in ON_HOLD_WAREHOUSES]
+        by_item = group_inventory_by_item(filtered_inv)
         items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
         
         # 2. Get sales from Portal DB for the last N days
