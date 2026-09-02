@@ -4574,36 +4574,52 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
         by_item = group_inventory_by_item(filtered_inv)
         items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
         
-        # 2. Get transactions from Google Drive Transaction file
-        # We look for any movement in the last N days
+        # 2. Get Sales from Portal DB for the last N days
+        sales_by_code = {}
+        sales_by_desc = {}
+        try:
+            conn = _get_portal_conn()
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT itemCode, itemDescription AS product, SUM(CAST(quantity AS DECIMAL(12,3))) AS total_sold
+                        FROM sales_transactions
+                        WHERE postingDate >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                        GROUP BY itemCode, itemDescription
+                        """,
+                        (days,)
+                    )
+                    sales_rows = cur.fetchall()
+            for r in sales_rows:
+                qty = float(r["total_sold"])
+                if r["itemCode"]:
+                    c = str(r["itemCode"]).strip().upper()
+                    sales_by_code[c] = sales_by_code.get(c, 0.0) + qty
+                if r["product"]:
+                    d = " ".join(str(r["product"]).lower().split())
+                    sales_by_desc[d] = sales_by_desc.get(d, 0.0) + qty
+        except Exception as e:
+            logger.warning(f"Failed to fetch sales from Portal DB for /slowmoving: {e}")
+
+        # 3. Get Transactions from Google Drive Transaction file
+        movement_by_code = {}
+        movement_by_desc = {}
         try:
             url = f"https://drive.google.com/uc?id={TRANSACTION_FILE_ID}&export=download"
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
             wb = openpyxl.load_workbook(io.BytesIO(resp.content), data_only=True)
             ws = wb.active
-            
-            # Find headers
             headers = [str(cell.value).strip() if cell.value else "" for cell in ws[1]]
             col_map = {h: i for i, h in enumerate(headers)}
-            
-            # Expected columns: Date, Item Code, Item Description, Quantity
-            # Adjust mapping based on file structure
-            date_idx = col_map.get("Date")
-            code_idx = col_map.get("Item Code")
-            desc_idx = col_map.get("Item Description")
-            qty_idx = col_map.get("Quantity")
-            
+            date_idx, code_idx, desc_idx, qty_idx = col_map.get("Date"), col_map.get("Item Code"), col_map.get("Item Description"), col_map.get("Quantity")
             cutoff = datetime.now(PHT) - timedelta(days=days)
-            movement_by_code = {}
-            movement_by_desc = {}
-            
             for row in ws.iter_rows(min_row=2, values_only=True):
                 r_date = row[date_idx] if date_idx is not None else None
                 if not isinstance(r_date, datetime):
                     try: r_date = datetime.strptime(str(r_date), "%Y-%m-%d")
                     except: continue
-                
                 if r_date.replace(tzinfo=PHT) >= cutoff:
                     qty = abs(float(row[qty_idx])) if qty_idx is not None and row[qty_idx] else 0
                     if code_idx is not None and row[code_idx]:
@@ -4613,22 +4629,20 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
                         d = " ".join(str(row[desc_idx]).lower().split())
                         movement_by_desc[d] = movement_by_desc.get(d, 0.0) + qty
         except Exception as e:
-            logger.error(f"Failed to parse transaction file: {e}")
-            await update_or_query.message.reply_text(f"❌ Error reading transaction file: {e}")
-            return
+            logger.warning(f"Failed to fetch transactions for /slowmoving: {e}")
 
-        # 3. Identify slow movers
+        # 4. Identify slow movers (No Sales AND No Movement)
         slow_movers = []
         for item_no, data in items_with_stock.items():
             code = str(item_no).strip().upper()
             desc = " ".join(str(data["desc"]).lower().split())
             
-            # Check movement by code first, then by description
-            moved = movement_by_code.get(code, 0.0)
-            if moved == 0:
-                moved = movement_by_desc.get(desc, 0.0)
+            # Check Sales first (Primary)
+            sold = sales_by_code.get(code, 0.0) or sales_by_desc.get(desc, 0.0)
+            # Check Movement second
+            moved = movement_by_code.get(code, 0.0) or movement_by_desc.get(desc, 0.0)
             
-            if moved == 0:
+            if sold == 0 and moved == 0:
                 slow_movers.append({
                     "item_no": item_no,
                     "desc": data["desc"],
