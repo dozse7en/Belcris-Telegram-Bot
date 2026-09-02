@@ -4611,8 +4611,21 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             resp.raise_for_status()
             wb = openpyxl.load_workbook(io.BytesIO(resp.content), data_only=True)
             ws = wb.active
-            headers = [str(cell.value).strip() if cell.value else "" for cell in ws[1]]
-            col_map = {h: i for i, h in enumerate(headers)}
+            # Scan first 10 rows for headers
+            header_row_idx = 1
+            col_map = {}
+            for i, row in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True)):
+                row_vals = [str(v).strip() if v else "" for v in row]
+                if "Item No." in row_vals or "Item Code" in row_vals or "Posting Date" in row_vals:
+                    header_row_idx = i + 1
+                    col_map = {v: idx for idx, v in enumerate(row_vals) if v}
+                    break
+            
+            if not col_map:
+                # Fallback to row 1 if scanning failed
+                headers = [str(cell.value).strip() if cell.value else "" for cell in ws[1]]
+                col_map = {h: i for i, h in enumerate(headers)}
+                header_row_idx = 1
             
             # Updated mapping for "Inventory Transactions v3.xlsx"
             date_idx = col_map.get("Posting Date") or col_map.get("Date")
@@ -4623,7 +4636,8 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             issue_idx = col_map.get("Issue Quantity")
             
             cutoff = datetime.now(PHT) - timedelta(days=days)
-            for row in ws.iter_rows(min_row=2, values_only=True):
+            # Start processing from the row AFTER the headers
+            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
                 r_date = row[date_idx] if date_idx is not None else None
                 
                 # Robust date parsing
