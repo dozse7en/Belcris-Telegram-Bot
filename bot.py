@@ -4602,38 +4602,34 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
         except Exception as e:
             logger.warning(f"Failed to fetch sales from Portal DB for /slowmoving: {e}")
 
-        # 3. Get Transactions from Google Drive Transaction file
+        # 3. Get Transactions from Google Drive Transaction file (via CSV export)
         movement_by_code = {}
         movement_by_desc = {}
+        tx_count = 0
         try:
-            url = f"https://drive.google.com/uc?id={TRANSACTION_FILE_ID}&export=download"
+            # Request as CSV to bypass Excel formatting errors
+            url = f"https://docs.google.com/spreadsheets/d/{TRANSACTION_FILE_ID}/export?format=csv"
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
-            # Use read_only=True to bypass XML style errors (ValueError: Max value is 14)
-            try:
-                wb = openpyxl.load_workbook(io.BytesIO(resp.content), read_only=True, data_only=True)
-            except Exception as e:
-                logger.warning(f"Failed to load with data_only, trying without: {e}")
-                wb = openpyxl.load_workbook(io.BytesIO(resp.content), read_only=True)
             
-            ws = wb.active
+            import csv
+            content = resp.content.decode('utf-8')
+            reader = list(csv.reader(io.StringIO(content)))
+            
             # Scan first 20 rows for headers
-            header_row_idx = 1
+            header_row_idx = 0
             col_map = {}
-            for i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True)):
-                row_vals = [str(v).strip() if v else "" for v in row]
+            for i, row in enumerate(reader[:20]):
+                row_vals = [str(v).strip() for v in row]
                 if "Item No." in row_vals or "Item Code" in row_vals or "Posting Date" in row_vals:
-                    header_row_idx = i + 1
+                    header_row_idx = i
                     col_map = {v: idx for idx, v in enumerate(row_vals) if v}
                     break
             
             if not col_map:
-                # Fallback to row 1 if scanning failed
-                headers = [str(cell.value).strip() if cell.value else "" for cell in ws[1]]
-                col_map = {h: i for i, h in enumerate(headers)}
-                header_row_idx = 1
+                header_row_idx = 0
+                col_map = {v: idx for idx, v in enumerate(reader[0]) if v}
             
-            # Updated mapping for "Inventory Transactions v3.xlsx"
             date_idx = col_map.get("Posting Date") or col_map.get("Date")
             month_idx = col_map.get("Month")
             code_idx = col_map.get("Item No.") or col_map.get("Item Code")
@@ -4642,47 +4638,47 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             issue_idx = col_map.get("Issue Quantity")
             
             cutoff = datetime.now(PHT) - timedelta(days=days)
-            # Start processing from the row AFTER the headers
-            tx_count = 0
-            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+            for row in reader[header_row_idx + 1:]:
                 tx_count += 1
-                r_date = row[date_idx] if date_idx is not None else None
-                
-                # Robust date parsing
-                if not isinstance(r_date, datetime):
-                    try:
-                        # Try parsing various formats found in Excel
-                        date_str = str(r_date).split()[0]
-                        if "/" in date_str:
-                            # Try M/D/Y then D/M/Y
-                            try: r_date = datetime.strptime(date_str, "%m/%d/%Y")
-                            except: r_date = datetime.strptime(date_str, "%d/%m/%Y")
-                        else:
-                            r_date = datetime.strptime(date_str, "%Y-%m-%d")
-                    except:
-                        # Fallback: check the "Month" column if date parsing fails
+                try:
+                    r_date_str = row[date_idx] if date_idx is not None else ""
+                    if not r_date_str: continue
+                    
+                    # Robust date parsing for CSV strings
+                    r_date = None
+                    date_str = r_date_str.split()[0]
+                    if "/" in date_str:
+                        try: r_date = datetime.strptime(date_str, "%m/%d/%Y")
+                        except:
+                            try: r_date = datetime.strptime(date_str, "%d/%m/%Y")
+                            except: pass
+                    else:
+                        try: r_date = datetime.strptime(date_str, "%Y-%m-%d")
+                        except: pass
+                    
+                    if not r_date:
+                        # Fallback to Month column
                         if month_idx is not None and row[month_idx]:
                             m_str = str(row[month_idx]).strip()
-                            # If month matches current or last month, we assume it's recent enough
                             current_m = datetime.now(PHT).strftime("%B %Y")
                             last_m = (datetime.now(PHT) - timedelta(days=30)).strftime("%B %Y")
                             if m_str in [current_m, last_m]:
-                                r_date = datetime.now(PHT) # Mark as recent
+                                r_date = datetime.now(PHT)
                             else: continue
                         else: continue
-                
-                if r_date.replace(tzinfo=PHT) >= cutoff:
-                    # Combine receipt and issue for total movement
-                    r_qty = abs(float(row[receipt_idx])) if receipt_idx is not None and row[receipt_idx] else 0
-                    i_qty = abs(float(row[issue_idx])) if issue_idx is not None and row[issue_idx] else 0
-                    qty = r_qty + i_qty
                     
-                    if code_idx is not None and row[code_idx]:
-                        c = str(row[code_idx]).strip().upper()
-                        movement_by_code[c] = movement_by_code.get(c, 0.0) + qty
-                    if desc_idx is not None and row[desc_idx]:
-                        d = " ".join(str(row[desc_idx]).lower().split())
-                        movement_by_desc[d] = movement_by_desc.get(d, 0.0) + qty
+                    if r_date.replace(tzinfo=PHT) >= cutoff:
+                        r_qty = abs(float(row[receipt_idx])) if receipt_idx is not None and row[receipt_idx] else 0
+                        i_qty = abs(float(row[issue_idx])) if issue_idx is not None and row[issue_idx] else 0
+                        qty = r_qty + i_qty
+                        
+                        if code_idx is not None and row[code_idx]:
+                            c = str(row[code_idx]).strip().upper()
+                            movement_by_code[c] = movement_by_code.get(c, 0.0) + qty
+                        if desc_idx is not None and row[desc_idx]:
+                            d = " ".join(str(row[desc_idx]).lower().split())
+                            movement_by_desc[d] = movement_by_desc.get(d, 0.0) + qty
+                except: continue
         except Exception as e:
             logger.error(f"CRITICAL: Failed to fetch transactions for /slowmoving: {e}")
             tx_count = -1 # Signal error
