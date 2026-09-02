@@ -4616,6 +4616,7 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             
             # Updated mapping for "Inventory Transactions v3.xlsx"
             date_idx = col_map.get("Posting Date") or col_map.get("Date")
+            month_idx = col_map.get("Month")
             code_idx = col_map.get("Item No.") or col_map.get("Item Code")
             desc_idx = col_map.get("Item Description")
             receipt_idx = col_map.get("Receipt Quantity")
@@ -4624,15 +4625,29 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             cutoff = datetime.now(PHT) - timedelta(days=days)
             for row in ws.iter_rows(min_row=2, values_only=True):
                 r_date = row[date_idx] if date_idx is not None else None
+                
+                # Robust date parsing
                 if not isinstance(r_date, datetime):
                     try:
-                        # Handle strings like '06/02/2026' or '2026-06-02'
+                        # Try parsing various formats found in Excel
                         date_str = str(r_date).split()[0]
                         if "/" in date_str:
-                            r_date = datetime.strptime(date_str, "%m/%d/%Y")
+                            # Try M/D/Y then D/M/Y
+                            try: r_date = datetime.strptime(date_str, "%m/%d/%Y")
+                            except: r_date = datetime.strptime(date_str, "%d/%m/%Y")
                         else:
                             r_date = datetime.strptime(date_str, "%Y-%m-%d")
-                    except: continue
+                    except:
+                        # Fallback: check the "Month" column if date parsing fails
+                        if month_idx is not None and row[month_idx]:
+                            m_str = str(row[month_idx]).strip()
+                            # If month matches current or last month, we assume it's recent enough
+                            current_m = datetime.now(PHT).strftime("%B %Y")
+                            last_m = (datetime.now(PHT) - timedelta(days=30)).strftime("%B %Y")
+                            if m_str in [current_m, last_m]:
+                                r_date = datetime.now(PHT) # Mark as recent
+                            else: continue
+                        else: continue
                 
                 if r_date.replace(tzinfo=PHT) >= cutoff:
                     # Combine receipt and issue for total movement
