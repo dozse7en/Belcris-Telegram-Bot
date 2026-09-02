@@ -4574,28 +4574,48 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
         items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
         
         # 2. Get sales from Portal DB for the last N days
+        # We try to get both itemCode and itemDescription for better matching
         conn = _get_portal_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT itemDescription AS product,
-                           SUM(CAST(quantity AS DECIMAL(12,3))) AS total_sold
+                    SELECT 
+                        itemCode,
+                        itemDescription AS product,
+                        SUM(CAST(quantity AS DECIMAL(12,3))) AS total_sold
                     FROM sales_transactions
                     WHERE postingDate >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
-                    GROUP BY itemDescription
+                    GROUP BY itemCode, itemDescription
                     """,
                     (days,)
                 )
                 sales_rows = cur.fetchall()
         
-        sales_map = {r["product"].strip().lower(): float(r["total_sold"]) for r in sales_rows if r["product"]}
+        # Build two maps for matching: by code and by cleaned description
+        sales_by_code = {}
+        sales_by_desc = {}
+        for r in sales_rows:
+            qty = float(r["total_sold"])
+            if r["itemCode"]:
+                code = str(r["itemCode"]).strip().upper()
+                sales_by_code[code] = sales_by_code.get(code, 0.0) + qty
+            if r["product"]:
+                # Clean description: lowercase, remove extra spaces
+                desc = " ".join(str(r["product"]).lower().split())
+                sales_by_desc[desc] = sales_by_desc.get(desc, 0.0) + qty
         
         # 3. Identify slow movers
         slow_movers = []
         for item_no, data in items_with_stock.items():
-            desc = data["desc"].strip().lower()
-            sold = sales_map.get(desc, 0.0)
+            code = str(item_no).strip().upper()
+            desc = " ".join(str(data["desc"]).lower().split())
+            
+            # Check by code first, then by description
+            sold = sales_by_code.get(code, 0.0)
+            if sold == 0:
+                sold = sales_by_desc.get(desc, 0.0)
+            
             if sold == 0:
                 slow_movers.append({
                     "item_no": item_no,
