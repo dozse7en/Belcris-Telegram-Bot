@@ -4558,15 +4558,17 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             else: await update_or_query.edit_message_text(text)
             return
 
-        # Filter inventory to exclude on-hold, FA, and Engineering warehouses before grouping
+        # Filter inventory to exclude on-hold, FA, Engineering, and SP items before grouping
         # Exclude any warehouse containing "FA" or "ENGINEERING" in name or code
+        # Exclude item codes starting with "SP"
         filtered_inv = [
             r for r in inventory 
             if r["whs_name"] not in ON_HOLD_WAREHOUSES and 
                r.get("whs_code") != "WDR12A" and
                "FA" not in r["whs_name"].upper() and
                "FA" not in r.get("whs_code", "").upper() and
-               "ENGINEERING" not in r["whs_name"].upper()
+               "ENGINEERING" not in r["whs_name"].upper() and
+               not str(r["item_no"]).upper().startswith("SP")
         ]
         by_item = group_inventory_by_item(filtered_inv)
         items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
