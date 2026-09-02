@@ -960,7 +960,7 @@ def correct_command_typo(text: str) -> str | None:
     """Return the corrected command if the text looks like a typo of a known command."""
     known = [
         "/search", "/check", "/refresh", "/summary", "/category", "/expiring",
-        "/low", "/warehouse", "/top", "/components", "/components_expiring",
+        "/low", "/warehouse", "/slowmoving", "/top", "/components", "/components_expiring",
         "/ar", "/client", "/aging", "/overdue", "/area", "/agent",
         "/arsearch", "/arsummary", "/arrefresh",
         "/ap", "/vendor", "/ap_summary", "/apsummary", "/apaging",
@@ -998,6 +998,7 @@ HELP_TEXT = (
     "• `/lowstock [keyword] [threshold]` — Items below threshold (default 500 kg)\n"
     "• `/warehouse <name or code>` — Stock in a specific warehouse\n"
     "• `/top` — Top 20 items by quantity\n"
+    "• `/slowmoving [days]` — Items with stock but no sales (default 30 days)\n"
     "• `/components [keyword]` — Component Warehouse stock with expiry dates (PRD use)\n"
     "• `/components_expiring [days]` — Components expiring within N days (default 30)\n\n"
     "*📋 Accounts Receivable:*\n"
@@ -1036,6 +1037,7 @@ ADMIN_HELP_ENTRIES = (
     "• `/register <id1>,<id2>,...` — Batch register users by Telegram ID\n"
     "• `/unregister <id>` — Remove a registered user\n"
     "• `/listusers` — List all registered users\n"
+    "• `/testreports` — Manually trigger automated reports (Admin only)\n"
     "• `/seen` — Show users who used the bot but are not registered\n"
     "• `/accessmode [off|soft|hard]` — View/set access enforcement mode\n"
     "• `/whitelistgroup [chat_id]` — Fully open the current (or given) group chat for all members\n"
@@ -1201,6 +1203,19 @@ async def cmd_unregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ User `{uid}` has been removed from the registered list.", parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text(f"❌ User `{uid}` was not registered.", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_testreports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/testreports — Manually trigger automated reports for testing (Admin only)."""
+    admin = update.effective_user
+    if not _is_admin(admin.id):
+        await update.message.reply_text("🚫 This command is admin-only.")
+        return
+    
+    await update.message.reply_text("🧪 Triggering automated reports for all whitelisted groups...")
+    asyncio.run_coroutine_threadsafe(send_automated_report("daily_inventory"), _loop)
+    asyncio.run_coroutine_threadsafe(send_automated_report("weekly_collections"), _loop)
+    asyncio.run_coroutine_threadsafe(send_automated_report("weekly_slowmoving"), _loop)
 
 
 async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4519,6 +4534,93 @@ async def cmd_salesmonth(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Monthly sales query failed: {e}")
 
 
+async def cmd_slowmoving(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _access_gate(update, context):
+        return
+    """/slowmoving [days] — Items with stock but no sales in N days (default 30)."""
+    days = 30
+    if context.args and context.args[0].isdigit():
+        days = int(context.args[0])
+
+    msg = await update.message.reply_text(f"🐢 Identifying slow-moving items (last {days} days)...")
+    
+    try:
+        # 1. Get all items with current stock
+        with store._lock:
+            inventory = store.inventory
+        
+        if not inventory:
+            await msg.edit_text("📭 Inventory is empty. Run /refresh first.")
+            return
+
+        by_item = group_inventory_by_item(inventory)
+        items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
+        
+        # 2. Get sales from Portal DB for the last N days
+        conn = _get_portal_conn()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT itemDescription AS product,
+                           SUM(CAST(quantity AS DECIMAL(12,3))) AS total_sold
+                    FROM sales_transactions
+                    WHERE postingDate >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                    GROUP BY itemDescription
+                    """,
+                    (days,)
+                )
+                sales_rows = cur.fetchall()
+        
+        # Build sales map (Description -> Qty)
+        # Note: We match by Description because itemCode isn't consistently available in the portal DB query.
+        sales_map = {r["product"].strip().lower(): float(r["total_sold"]) for r in sales_rows if r["product"]}
+        
+        # 3. Identify slow movers (Stock > 0, Sales = 0 or very low)
+        slow_movers = []
+        for item_no, data in items_with_stock.items():
+            desc = data["desc"].strip().lower()
+            sold = sales_map.get(desc, 0.0)
+            if sold == 0:
+                slow_movers.append({
+                    "item_no": item_no,
+                    "desc": data["desc"],
+                    "stock": data["total"],
+                    "sold": sold
+                })
+        
+        # Sort by stock value (descending)
+        slow_movers.sort(key=lambda x: x["stock"], reverse=True)
+        
+        lines = [
+            f"🐢 *Slow-Moving Items (Last {days} Days)*",
+            f"_Items with stock but ZERO sales recorded._",
+            "",
+        ]
+        
+        if not slow_movers:
+            lines.append("✨ *No slow-moving items found!* All stocked items have recent sales.")
+        else:
+            # Show top 20
+            for i, item in enumerate(slow_movers[:20], 1):
+                lines.append(f"{i}. *{item['desc']}* (`{item['item_no']}`)")
+                lines.append(f"   Stock: {item['stock']:,.1f} units | Sales: 0")
+            
+            if len(slow_movers) > 20:
+                lines.append(f"\n_...and {len(slow_movers) - 20} more items._")
+            
+            lines.append("")
+            lines.append(f"📦 *Total Slow Items: {len(slow_movers)}*")
+            
+        lines.append("")
+        lines.append(inv_source_footer())
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        logger.error(f"cmd_slowmoving error: {e}")
+        await msg.edit_text(f"❌ Failed to calculate slow-moving items: {e}")
+
+
 # ── Free-text handler ─────────────────────────────────────────────────────────
 async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
@@ -4562,8 +4664,151 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Background refresh thread
+# Background Scheduler & Automated Reports
 # ──────────────────────────────────────────────────────────────────────────────
+
+async def send_automated_report(report_type: str):
+    """Generate and send an automated report to all whitelisted groups."""
+    groups = list_allowed_groups()
+    if not groups:
+        logger.info(f"No whitelisted groups found for {report_type} report.")
+        return
+
+    logger.info(f"Generating automated {report_type} report...")
+    
+    # 1. Refresh data first to ensure accuracy
+    refresh_all_data()
+    
+    lines = []
+    if report_type == "daily_inventory":
+        # Simplified version of cmd_summary for executive overview
+        inv = store.inventory
+        total_qty = int(sum(r["in_stock"] for r in inv))
+        unique_items = len(set(r["item_no"] for r in inv))
+        
+        # Low stock items
+        low_stock = []
+        by_item = group_inventory_by_item(inv)
+        for k, v in by_item.items():
+            if v["total"] < 500: # Standard threshold
+                low_stock.append(v)
+        
+        lines = [
+            "☀️ *Daily Inventory Report*",
+            f"Total Stock: {total_qty:,} units",
+            f"Unique Items: {unique_items:,}",
+            "",
+            f"⚠️ *Low Stock Alerts (<500kg):* {len(low_stock)} items",
+        ]
+        if low_stock:
+            for item in sorted(low_stock, key=lambda x: x["total"])[:5]:
+                lines.append(f"• {item['desc']}: {int(item['total']):,} units")
+        
+        lines.append("\n" + inv_source_footer())
+
+    elif report_type == "weekly_collections":
+        # Overdue AR reminder
+        if not store.ar_rows:
+            return
+            
+        overdue = [r for r in store.ar_rows if r["days_due"] >= 30]
+        total_overdue = sum(r["balance"] for r in overdue)
+        
+        by_area = {}
+        for r in overdue:
+            a = r.get("area", "").strip() or "UNCLASSIFIED"
+            by_area[a] = by_area.get(a, 0.0) + r["balance"]
+            
+        lines = [
+            "💰 *Weekly Collection Reminder*",
+            f"Total Overdue (30d+): {fmt_peso(total_overdue)}",
+            "",
+            "*Overdue by Area:*",
+        ]
+        for area, bal in sorted(by_area.items(), key=lambda x: x[1], reverse=True)[:10]:
+            lines.append(f"• {area}: {fmt_peso(bal)}")
+            
+        lines.append("\n" + ar_source_footer())
+
+    elif report_type == "weekly_slowmoving":
+        # Slow moving items (30 days)
+        inv = store.inventory
+        by_item = group_inventory_by_item(inv)
+        items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
+        
+        try:
+            conn = _get_portal_conn()
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT itemDescription AS product, SUM(CAST(quantity AS DECIMAL(12,3))) AS total_sold "
+                        "FROM sales_transactions WHERE postingDate >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) GROUP BY itemDescription"
+                    )
+                    sales_rows = cur.fetchall()
+            sales_map = {r["product"].strip().lower(): float(r["total_sold"]) for r in sales_rows if r["product"]}
+            
+            slow = []
+            for item_no, data in items_with_stock.items():
+                if sales_map.get(data["desc"].strip().lower(), 0.0) == 0:
+                    slow.append(data)
+            
+            lines = [
+                "🐢 *Weekly Slow-Moving Spotlight*",
+                "_Items with stock but ZERO sales in 30 days._",
+                "",
+            ]
+            for item in sorted(slow, key=lambda x: x["total"], reverse=True)[:10]:
+                lines.append(f"• {item['desc']}: {int(item['total']):,} units")
+            
+            lines.append("\n" + inv_source_footer())
+        except:
+            return
+
+    if not lines:
+        return
+
+    text = "\n".join(lines)
+    for g in groups:
+        chat_id = g["telegram_chat_id"]
+        try:
+            await tg_app.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
+            logger.info(f"Sent {report_type} report to {chat_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send automated report to {chat_id}: {e}")
+
+
+def background_scheduler_loop():
+    """Background thread to trigger automated reports at specific times (PHT)."""
+    import time
+    logger.info("Background scheduler started.")
+    
+    # Track last sent date to avoid double sending
+    last_daily = None
+    last_weekly = None
+    
+    while True:
+        try:
+            now = datetime.now(PHT)
+            today_str = now.strftime("%Y-%m-%d")
+            week_str = now.strftime("%Y-%U") # Year-WeekNumber
+            
+            # 1. Daily Inventory Report: 8:00 AM PHT
+            if now.hour == 8 and last_daily != today_str:
+                asyncio.run_coroutine_threadsafe(send_automated_report("daily_inventory"), _loop)
+                last_daily = today_str
+            
+            # 2. Weekly Reports (Monday 9:00 AM PHT)
+            if now.weekday() == 0 and now.hour == 9 and last_weekly != week_str:
+                asyncio.run_coroutine_threadsafe(send_automated_report("weekly_collections"), _loop)
+                asyncio.run_coroutine_threadsafe(send_automated_report("weekly_slowmoving"), _loop)
+                last_weekly = week_str
+                
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+            
+        time.sleep(60) # Check every minute
+
+
 def background_refresh_loop():
     import time
     while True:
@@ -4593,6 +4838,7 @@ tg_app.add_handler(CommandHandler("refresh",    cmd_refresh))
 tg_app.add_handler(CommandHandler("register",   cmd_register))
 tg_app.add_handler(CommandHandler("unregister", cmd_unregister))
 tg_app.add_handler(CommandHandler("listusers",  cmd_listusers))
+tg_app.add_handler(CommandHandler("testreports", cmd_testreports))
 tg_app.add_handler(CommandHandler("summarize",  cmd_summarize))
 tg_app.add_handler(CommandHandler("seen",       cmd_seen))
 tg_app.add_handler(CommandHandler("accessmode", cmd_accessmode))
@@ -4612,6 +4858,7 @@ tg_app.add_handler(CommandHandler("expiring",   cmd_expiring))
 tg_app.add_handler(CommandHandler("low",        cmd_low))
 tg_app.add_handler(CommandHandler("lowstock",   cmd_lowstock))
 tg_app.add_handler(CommandHandler("warehouse",  cmd_warehouse))
+tg_app.add_handler(CommandHandler("slowmoving", cmd_slowmoving))
 tg_app.add_handler(CallbackQueryHandler(cb_warehouse_show_all, pattern=r"^whs_all\|"))
 tg_app.add_handler(CallbackQueryHandler(cb_expiring_show_all, pattern=r"^exp_all\|"))
 tg_app.add_handler(CallbackQueryHandler(cb_check_show_all, pattern=r"^check_all\|"))
@@ -4717,6 +4964,10 @@ def main():
     # Start background refresh thread
     t = threading.Thread(target=background_refresh_loop, daemon=True)
     t.start()
+
+    # Start background scheduler thread
+    ts = threading.Thread(target=background_scheduler_loop, daemon=True)
+    ts.start()
 
     # Create a persistent event loop and run it in a background thread
     _loop = asyncio.new_event_loop()
