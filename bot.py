@@ -4609,12 +4609,18 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             url = f"https://drive.google.com/uc?id={TRANSACTION_FILE_ID}&export=download"
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
-            wb = openpyxl.load_workbook(io.BytesIO(resp.content), data_only=True)
+            # Use read_only=True to bypass XML style errors (ValueError: Max value is 14)
+            try:
+                wb = openpyxl.load_workbook(io.BytesIO(resp.content), read_only=True, data_only=True)
+            except Exception as e:
+                logger.warning(f"Failed to load with data_only, trying without: {e}")
+                wb = openpyxl.load_workbook(io.BytesIO(resp.content), read_only=True)
+            
             ws = wb.active
-            # Scan first 10 rows for headers
+            # Scan first 20 rows for headers
             header_row_idx = 1
             col_map = {}
-            for i, row in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True)):
+            for i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True)):
                 row_vals = [str(v).strip() if v else "" for v in row]
                 if "Item No." in row_vals or "Item Code" in row_vals or "Posting Date" in row_vals:
                     header_row_idx = i + 1
@@ -4637,7 +4643,9 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             
             cutoff = datetime.now(PHT) - timedelta(days=days)
             # Start processing from the row AFTER the headers
+            tx_count = 0
             for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+                tx_count += 1
                 r_date = row[date_idx] if date_idx is not None else None
                 
                 # Robust date parsing
@@ -4676,7 +4684,8 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
                         d = " ".join(str(row[desc_idx]).lower().split())
                         movement_by_desc[d] = movement_by_desc.get(d, 0.0) + qty
         except Exception as e:
-            logger.warning(f"Failed to fetch transactions for /slowmoving: {e}")
+            logger.error(f"CRITICAL: Failed to fetch transactions for /slowmoving: {e}")
+            tx_count = -1 # Signal error
 
         # 4. Identify slow movers (No Sales AND No Movement)
         slow_movers = []
@@ -4717,7 +4726,7 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             
             lines.append("")
             lines.append(f"📦 *Total Slow Items: {len(slow_movers)}*")
-            
+        lines.append(f"📊 _Analyzed {len(sales_by_code)} sales & {tx_count if tx_count >= 0 else 'ERROR'} movements_")
         lines.append("")
         lines.append(inv_source_footer())
         
