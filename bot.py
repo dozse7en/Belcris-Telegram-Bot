@@ -4543,18 +4543,22 @@ async def cmd_slowmoving(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = int(context.args[0])
 
     msg = await update.message.reply_text(f"🐢 Identifying slow-moving items (last {days} days)...")
-    
+    await _do_slowmoving(msg, days, show_all=False)
+
+
+async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
     try:
         # 1. Get all items with current stock
         with store._lock:
             inventory = store.inventory
         
         if not inventory:
-            await msg.edit_text("📭 Inventory is empty. Run /refresh first.")
+            text = "📭 Inventory is empty. Run /refresh first."
+            if hasattr(update_or_query, 'edit_text'): await update_or_query.edit_text(text)
+            else: await update_or_query.edit_message_text(text)
             return
 
         # Filter inventory to exclude on-hold and FA warehouses before grouping
-        # FA Warehouse code is WDR12A
         filtered_inv = [
             r for r in inventory 
             if r["whs_name"] not in ON_HOLD_WAREHOUSES and r.get("whs_code") != "WDR12A"
@@ -4578,11 +4582,9 @@ async def cmd_slowmoving(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 sales_rows = cur.fetchall()
         
-        # Build sales map (Description -> Qty)
-        # Note: We match by Description because itemCode isn't consistently available in the portal DB query.
         sales_map = {r["product"].strip().lower(): float(r["total_sold"]) for r in sales_rows if r["product"]}
         
-        # 3. Identify slow movers (Stock > 0, Sales = 0 or very low)
+        # 3. Identify slow movers
         slow_movers = []
         for item_no, data in items_with_stock.items():
             desc = data["desc"].strip().lower()
@@ -4591,13 +4593,12 @@ async def cmd_slowmoving(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 slow_movers.append({
                     "item_no": item_no,
                     "desc": data["desc"],
-                    "stock": data["total"],
-                    "sold": sold
+                    "stock": data["total"]
                 })
         
-        # Sort by stock value (descending)
         slow_movers.sort(key=lambda x: x["stock"], reverse=True)
         
+        PREVIEW_LIMIT = 20
         lines = [
             f"🐢 *Slow-Moving Items (Last {days} Days)*",
             f"_Items with stock but ZERO sales recorded._",
@@ -4607,24 +4608,77 @@ async def cmd_slowmoving(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not slow_movers:
             lines.append("✨ *No slow-moving items found!* All stocked items have recent sales.")
         else:
-            # Show top 20
-            for i, item in enumerate(slow_movers[:20], 1):
-                lines.append(f"{i}. *{item['desc']}* (`{item['item_no']}`)")
-                lines.append(f"   Stock: {item['stock']:,.1f} units | Sales: 0")
+            display_items = slow_movers if show_all else slow_movers[:PREVIEW_LIMIT]
+            for i, item in enumerate(display_items, 1):
+                lines.append(f"{i}. *{item['desc']}* (`{item['item_no']}`): {item['stock']:,.1f}")
             
-            if len(slow_movers) > 20:
-                lines.append(f"\n_...and {len(slow_movers) - 20} more items._")
+            if not show_all and len(slow_movers) > PREVIEW_LIMIT:
+                lines.append(f"\n_Showing {PREVIEW_LIMIT} of {len(slow_movers)} items_")
             
             lines.append("")
             lines.append(f"📦 *Total Slow Items: {len(slow_movers)}*")
             
         lines.append("")
         lines.append(inv_source_footer())
-        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        
+        text = "\n".join(lines)
+        reply_markup = None
+        if not show_all and len(slow_movers) > PREVIEW_LIMIT:
+            cb_data = f"slow_all|{days}"
+            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+                f"📋 Show All ({len(slow_movers)} items)", callback_data=cb_data
+            )]])
+
+        if show_all:
+            # Chunking logic for long lists
+            MAX_LEN = 3800
+            chunks, cur = [], ""
+            for line in lines:
+                addition = ("\n" + line) if cur else line
+                if len(cur) + len(addition) > MAX_LEN:
+                    chunks.append(cur)
+                    cur = line
+                else:
+                    cur += addition
+            if cur: chunks.append(cur)
+            
+            first = True
+            for chunk in chunks:
+                if first:
+                    if hasattr(update_or_query, 'edit_text'): await update_or_query.edit_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                    else: await update_or_query.edit_message_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                else:
+                    await update_or_query.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                first = False
+        else:
+            if hasattr(update_or_query, 'edit_text'): await update_or_query.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+            else: await update_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
     except Exception as e:
-        logger.error(f"cmd_slowmoving error: {e}")
-        await msg.edit_text(f"❌ Failed to calculate slow-moving items: {e}")
+        logger.error(f"_do_slowmoving error: {e}")
+        err_text = f"❌ Failed to calculate slow-moving items: {e}"
+        if hasattr(update_or_query, 'edit_text'): await update_or_query.edit_text(err_text)
+        else: await update_or_query.edit_message_text(err_text)
+
+
+async def cb_slowmoving_show_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback: show all slow-moving items."""
+    query = update.callback_query
+    user = query.from_user
+    chat = query.message.chat if query.message is not None else None
+    if chat is not None: log_chat(chat.id, chat.type, chat.title)
+    if user is not None:
+        log_user(user.id, user.username, user.full_name)
+        if not is_registered(user.id):
+            if chat is not None and is_whitelisted_group(chat.id): pass
+            elif ACCESS_MODE == "hard":
+                await _send_blocked_notice(query, str(user.id))
+                return
+            elif ACCESS_MODE == "soft":
+                await _send_blocked_notice(query, str(user.id))
+    await query.answer()
+    days = int(query.data.split("|")[1]) if "|" in query.data else 30
+    await _do_slowmoving(query, days, show_all=True)
 
 
 # ── Free-text handler ─────────────────────────────────────────────────────────
@@ -4865,6 +4919,7 @@ tg_app.add_handler(CommandHandler("low",        cmd_low))
 tg_app.add_handler(CommandHandler("lowstock",   cmd_lowstock))
 tg_app.add_handler(CommandHandler("warehouse",  cmd_warehouse))
 tg_app.add_handler(CommandHandler("slowmoving", cmd_slowmoving))
+tg_app.add_handler(CallbackQueryHandler(cb_slowmoving_show_all, pattern=r"^slow_all\|"))
 tg_app.add_handler(CallbackQueryHandler(cb_warehouse_show_all, pattern=r"^whs_all\|"))
 tg_app.add_handler(CallbackQueryHandler(cb_expiring_show_all, pattern=r"^exp_all\|"))
 tg_app.add_handler(CallbackQueryHandler(cb_check_show_all, pattern=r"^check_all\|"))
