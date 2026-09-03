@@ -1891,15 +1891,18 @@ async def cmd_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _access_gate(update, context):
         return
-# placeholder for cmd_expiring
-    """Items expiring in N days (default 30)."""
+    """Items expiring in N days (default 30) [segment].
+    Example: /expiring 60 Manila
+    """
     days = 30
+    segment = ""
     if context.args:
-        try:
+        if context.args[0].isdigit():
             days = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text("Usage: `/expiring [days]`\nExample: `/expiring 60`", parse_mode=ParseMode.MARKDOWN)
-            return
+            if len(context.args) > 1:
+                segment = " ".join(context.args[1:]).strip()
+        else:
+            segment = " ".join(context.args).strip()
 
     if not store.inventory:
         await update.message.reply_text("⚠️ Inventory data not loaded yet. Try `/refresh`.", parse_mode=ParseMode.MARKDOWN)
@@ -1907,13 +1910,20 @@ async def cmd_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     now_pht = datetime.now(PHT)
     today = now_pht.date()
-    cutoff = today + timedelta(days=days)
-
+    
     expiring = []
     for r in store.inventory:
         if r["in_stock"] <= 0:
             continue
-        exp_date = r.get("exp_date")  # always a date object from parse_exp_date
+        
+        # Filter by segment if provided
+        if segment:
+            whs_name = str(r.get("whs_name", "")).lower()
+            whs_code = str(r.get("whs_code", "")).lower()
+            if segment.lower() not in whs_name and segment.lower() not in whs_code:
+                continue
+
+        exp_date = r.get("exp_date")
         if exp_date is None:
             continue
         days_left = (exp_date - today).days
@@ -1921,8 +1931,9 @@ async def cmd_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE):
             expiring.append({**r, "days_left": days_left, "exp_date_obj": exp_date})
 
     if not expiring:
+        seg_label = f" in {segment}" if segment else ""
         await update.message.reply_text(
-            f"✅ No items expiring within {days} days.",
+            f"✅ No items expiring within {days} days{seg_label}.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -1932,7 +1943,7 @@ async def cmd_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expiring.sort(key=lambda x: x["days_left"])
     by_item_proc = {}   # Processed Foods
     by_item_trd  = {}   # Trading (TR prefix)
-    by_item_ing  = {}   # Ingredients & Spices (FA/Component warehouses)
+    by_item_ing  = {}   # Ingredients & Spices
 
     for r in expiring:
         k = r["item_no"]
@@ -1953,7 +1964,7 @@ async def cmd_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     proc_items = sorted(by_item_proc.values(), key=lambda x: x["min_days"])
     trd_items  = sorted(by_item_trd.values(),  key=lambda x: x["min_days"])
     ing_items  = sorted(by_item_ing.values(),  key=lambda x: x["min_days"])
-    await _send_expiring_split(update, proc_items, trd_items, ing_items, days)
+    await _send_expiring_split(update, proc_items, trd_items, ing_items, days, segment=segment)
 
 
 def _expiry_emoji(days_left: int) -> str:
@@ -2043,13 +2054,14 @@ def _build_expiring_section(title: str, items: list, days: int, preview: int = 2
     return "\n".join(lines), has_more
 
 
-async def _send_expiring_split(update_obj, proc_items: list, trd_items: list, ing_items: list, days: int, show_all: bool = False):
+async def _send_expiring_split(update_obj, proc_items: list, trd_items: list, ing_items: list, days: int, segment: str = "", show_all: bool = False):
     """Send expiring items in 3 sections: Processed Foods, Trading, Ingredients."""
     MAX_LEN = 4000
     PREVIEW = 20
     total = len(proc_items) + len(trd_items) + len(ing_items)
 
-    header = f"⚠️ *Items Expiring Within {days} Days* ({total} items)\n"
+    seg_label = f" in {segment.upper()}" if segment else ""
+    header = f"⚠️ *Items Expiring Within {days} Days{seg_label}* ({total} items)\n"
 
     proc_text, proc_more = _build_expiring_section(
         f"🏭 *Processed Foods* ({len(proc_items)} items)", proc_items, days, PREVIEW, show_all)
@@ -2093,7 +2105,7 @@ async def _send_expiring_split(update_obj, proc_items: list, trd_items: list, in
                 first = False
 
     if has_more:
-        cb_data = f"exp_all|{days}"
+        cb_data = f"exp_all|{days}|{segment}"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
             f"📋 Show All ({total} items)", callback_data=cb_data
         )]])
@@ -2258,8 +2270,10 @@ async def cb_expiring_show_all(update: Update, context: ContextTypes.DEFAULT_TYP
                 await _send_blocked_notice(query, str(user.id))
                 # soft: continue
     await query.answer()
+    # Format: exp_all|days|segment
     parts = query.data.split("|")
     days = int(parts[1]) if len(parts) > 1 else 30
+    segment = parts[2] if len(parts) > 2 else ""
 
     INGREDIENT_WHS = {"WDR12A", "WCS10A"}
     today = datetime.now(PHT).date()
@@ -2267,6 +2281,14 @@ async def cb_expiring_show_all(update: Update, context: ContextTypes.DEFAULT_TYP
     for r in store.inventory:
         if r["in_stock"] <= 0:
             continue
+        
+        # Filter by segment if provided
+        if segment:
+            whs_name = str(r.get("whs_name", "")).lower()
+            whs_code = str(r.get("whs_code", "")).lower()
+            if segment.lower() not in whs_name and segment.lower() not in whs_code:
+                continue
+
         exp_date = r.get("exp_date")
         if exp_date is None:
             continue
@@ -2297,7 +2319,7 @@ async def cb_expiring_show_all(update: Update, context: ContextTypes.DEFAULT_TYP
     proc_items = sorted(by_item_proc.values(), key=lambda x: x["min_days"])
     trd_items  = sorted(by_item_trd.values(),  key=lambda x: x["min_days"])
     ing_items  = sorted(by_item_ing.values(),  key=lambda x: x["min_days"])
-    await _send_expiring_split(query, proc_items, trd_items, ing_items, days, show_all=True)
+    await _send_expiring_split(query, proc_items, trd_items, ing_items, days, segment=segment, show_all=True)
 
 
 async def cmd_low(update: Update, context: ContextTypes.DEFAULT_TYPE):

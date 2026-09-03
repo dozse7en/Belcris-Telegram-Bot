@@ -40,15 +40,16 @@ This file tracks all changes, fixes, lessons learned, and architectural decision
 ## Version History
 
 ### v4.3 — 2026-09-03
-**Slow-Moving Analysis Improvements:**
-- **Segment/Sales Office Filtering:** `/slowmoving [days] [segment]` now supports filtering by sales office (segment). It filters both current inventory warehouses and Portal DB sales/transaction records by the segment keyword.
+**Segment Support & Accuracy Improvements:**
+- **Expiring Report Segment Filtering:** `/expiring [days] [segment]` now supports filtering by area/segment (e.g., `/expiring 30 Manila`). This allows sales offices to monitor their specific upcoming expirations.
+- **Slow-Moving Segment Filtering:** `/slowmoving [days] [segment]` now supports filtering by sales office. It filters both current inventory warehouses and Portal DB sales/transaction records by the segment keyword.
 - **Improved Accuracy:**
     - Fixed header lookup logic to handle zero-index columns correctly.
     - Enhanced date parsing to support multiple formats (`YYYY/MM/DD`, `DD/MM/YYYY`, `MM/DD/YYYY`, and dash-separated variants).
     - Added segment-aware sales office filtering in Portal DB queries (`location` field).
 - **Diagnostic Tool:** New admin-only command `/itemactivity <itemCode> [days]` provides a deep-dive report on stock levels, Portal DB sales, and transaction history for a specific item to verify slow-moving status.
 - **Unified Logic:** The weekly automated slow-moving report now uses the same robust analysis logic as the manual command.
-- **Show All Support:** Added segment persistence in the "Show All" callback for slow-moving reports.
+- **Show All Support:** Added segment persistence in "Show All" callbacks for both `/slowmoving` and `/expiring` reports.
 
 ### v4.2 — 2026-08-10
 **Help visibility fix:**
