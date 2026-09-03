@@ -4538,16 +4538,25 @@ async def cmd_salesmonth(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_slowmoving(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _access_gate(update, context):
         return
-    """/slowmoving [days] — Items with stock but no sales in N days (default 30)."""
+    """/slowmoving [days] [segment] — Items with stock but no sales in N days (default 30).
+    Example: /slowmoving 30 Manila
+    """
     days = 30
-    if context.args and context.args[0].isdigit():
-        days = int(context.args[0])
+    segment = ""
+    if context.args:
+        if context.args[0].isdigit():
+            days = int(context.args[0])
+            if len(context.args) > 1:
+                segment = " ".join(context.args[1:]).strip()
+        else:
+            # First arg is the segment
+            segment = " ".join(context.args).strip()
 
-    msg = await update.message.reply_text(f"🐢 Identifying slow-moving items (last {days} days)...")
-    await _do_slowmoving(msg, days, show_all=False)
+    msg = await update.message.reply_text(f"🐢 Identifying slow-moving items (last {days} days{' in ' + segment if segment else ''})...")
+    await _do_slowmoving(msg, days, segment=segment, show_all=False)
 
 
-async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
+async def _do_slowmoving(update_or_query, days: int, segment: str = "", show_all: bool = False):
     try:
         # 1. Get all items with current stock
         with store._lock:
@@ -4569,7 +4578,8 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
                "FA" not in r["whs_name"].upper() and
                "FA" not in r.get("whs_code", "").upper() and
                "ENGINEERING" not in r["whs_name"].upper() and
-               not str(r["item_no"]).upper().startswith("SP")
+               not str(r["item_no"]).upper().startswith("SP") and
+               (not segment or segment.lower() in r["whs_name"].lower() or segment.lower() in r.get("whs_code", "").lower())
         ]
         by_item = group_inventory_by_item(filtered_inv)
         items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
@@ -4581,15 +4591,18 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
             conn = _get_portal_conn()
             with conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
+                    sql = """
                         SELECT itemCode, itemDescription AS product, SUM(CAST(quantity AS DECIMAL(12,3))) AS total_sold
                         FROM sales_transactions
                         WHERE postingDate >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
-                        GROUP BY itemCode, itemDescription
-                        """,
-                        (days,)
-                    )
+                    """
+                    params = [days]
+                    if segment:
+                        sql += " AND location LIKE %s"
+                        params.append(f"%{segment}%")
+                    sql += " GROUP BY itemCode, itemDescription"
+                    
+                    cur.execute(sql, tuple(params))
                     sales_rows = cur.fetchall()
             for r in sales_rows:
                 qty = float(r["total_sold"])
@@ -4630,17 +4643,29 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
                 header_row_idx = 0
                 col_map = {v: idx for idx, v in enumerate(reader[0]) if v}
             
-            date_idx = col_map.get("Posting Date") or col_map.get("Date")
+            def first_present(m, *keys):
+                for k in keys:
+                    if k in m: return m[k]
+                return None
+
+            date_idx = first_present(col_map, "Posting Date", "Date")
             month_idx = col_map.get("Month")
-            code_idx = col_map.get("Item No.") or col_map.get("Item Code")
+            code_idx = first_present(col_map, "Item No.", "Item Code")
             desc_idx = col_map.get("Item Description")
             receipt_idx = col_map.get("Receipt Quantity")
             issue_idx = col_map.get("Issue Quantity")
+            whs_idx = first_present(col_map, "Whse Name", "Whse")
             
             cutoff = datetime.now(PHT) - timedelta(days=days)
             for row in reader[header_row_idx + 1:]:
                 tx_count += 1
                 try:
+                    # Filter by segment in transaction file if provided
+                    if segment and whs_idx is not None:
+                        row_whs = str(row[whs_idx]).lower()
+                        if segment.lower() not in row_whs:
+                            continue
+
                     r_date_str = row[date_idx] if date_idx is not None else ""
                     if not r_date_str: continue
                     
@@ -4648,13 +4673,17 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
                     r_date = None
                     date_str = r_date_str.split()[0]
                     if "/" in date_str:
-                        try: r_date = datetime.strptime(date_str, "%m/%d/%Y")
-                        except:
-                            try: r_date = datetime.strptime(date_str, "%d/%m/%Y")
-                            except: pass
-                    else:
-                        try: r_date = datetime.strptime(date_str, "%Y-%m-%d")
-                        except: pass
+                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                            try:
+                                r_date = datetime.strptime(date_str, fmt)
+                                break
+                            except: continue
+                    elif "-" in date_str:
+                        for fmt in ("%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y"):
+                            try:
+                                r_date = datetime.strptime(date_str, fmt)
+                                break
+                            except: continue
                     
                     if not r_date:
                         # Fallback to Month column
@@ -4704,8 +4733,9 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
         slow_movers.sort(key=lambda x: x["stock"], reverse=True)
         
         PREVIEW_LIMIT = 20
+        seg_label = f" [{segment.upper()}]" if segment else ""
         lines = [
-            f"🐢 *Slow-Moving Items (Last {days} Days)*",
+            f"🐢 *Slow-Moving Items{seg_label} (Last {days} Days)*",
             f"_Items with stock but ZERO sales recorded._",
             "",
         ]
@@ -4729,7 +4759,7 @@ async def _do_slowmoving(update_or_query, days: int, show_all: bool = False):
         text = "\n".join(lines)
         reply_markup = None
         if not show_all and len(slow_movers) > PREVIEW_LIMIT:
-            cb_data = f"slow_all|{days}"
+            cb_data = f"slow_all|{days}|{segment}"
             reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(
                 f"📋 Show All ({len(slow_movers)} items)", callback_data=cb_data
             )]])
@@ -4782,8 +4812,170 @@ async def cb_slowmoving_show_all(update: Update, context: ContextTypes.DEFAULT_T
             elif ACCESS_MODE == "soft":
                 await _send_blocked_notice(query, str(user.id))
     await query.answer()
-    days = int(query.data.split("|")[1]) if "|" in query.data else 30
-    await _do_slowmoving(query, days, show_all=True)
+    # Format: slow_all|days|segment
+    parts = query.data.split("|")
+    days = int(parts[1]) if len(parts) > 1 else 30
+    segment = parts[2] if len(parts) > 2 else ""
+    await _do_slowmoving(query, days, segment=segment, show_all=True)
+
+
+async def cmd_itemactivity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: Diagnostic tool to check activity for a specific item code."""
+    if not await _access_gate(update, context):
+        return
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: `/itemactivity <itemCode> [days]`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    code = context.args[0].strip().upper()
+    days = 30
+    if len(context.args) > 1 and context.args[1].isdigit():
+        days = int(context.args[1])
+    
+    msg = await update.message.reply_text(f"🔍 Investigating activity for `{code}` (last {days} days)...", parse_mode=ParseMode.MARKDOWN)
+    
+    try:
+        results = []
+        results.append(f"🔎 *Activity Report: {code}*")
+        results.append(f"_Analysis period: {days} days_")
+        results.append("")
+
+        # 1. Check Inventory
+        with store._lock:
+            inv_rows = [r for r in store.inventory if str(r["item_no"]).upper() == code]
+        
+        if inv_rows:
+            total_stock = sum(r["quantity"] for r in inv_rows)
+            results.append(f"📦 *Current Stock:* {total_stock:,.1f}")
+            for r in inv_rows:
+                results.append(f"  • {r['whs_name']} ({r.get('whs_code', 'N/A')}): {r['quantity']:,.1f}")
+        else:
+            results.append("📦 *Current Stock:* 0 (or not found in inventory)")
+        results.append("")
+
+        # 2. Check Portal DB Sales
+        results.append("💳 *Portal DB Sales:*")
+        sales_found = False
+        try:
+            conn = _get_portal_conn()
+            if conn:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT postingDate, customerName, quantity, location
+                            FROM sales_transactions
+                            WHERE itemCode = %s AND postingDate >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                            ORDER BY postingDate DESC
+                            """,
+                            (code, days)
+                        )
+                        sales = cur.fetchall()
+                if sales:
+                    sales_found = True
+                    for s in sales[:10]: # Limit to 10
+                        results.append(f"  • {s['postingDate']}: {float(s['quantity']):,.1f} to {s['customerName']} ({s['location']})")
+                    if len(sales) > 10:
+                        results.append(f"  _...and {len(sales)-10} more records_")
+                else:
+                    results.append("  _No sales found in Portal DB for this period._")
+            else:
+                results.append("  ⚠️ Portal DB not available (no PORTAL_DB_URL).")
+        except Exception as e:
+            results.append(f"  ⚠️ Error querying Portal DB: {e}")
+        results.append("")
+
+        # 3. Check Inventory Transactions CSV
+        results.append("🚚 *Inventory Transactions (Movement):*")
+        movements_found = False
+        try:
+            url = f"https://docs.google.com/spreadsheets/d/{TRANSACTION_FILE_ID}/export?format=csv"
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            import csv
+            content = resp.content.decode('utf-8')
+            reader = list(csv.reader(io.StringIO(content)))
+            
+            # Header logic same as _do_slowmoving
+            header_row_idx = 0
+            col_map = {}
+            for i, row in enumerate(reader[:20]):
+                row_vals = [str(v).strip() for v in row]
+                if "Item No." in row_vals or "Item Code" in row_vals or "Posting Date" in row_vals:
+                    header_row_idx = i
+                    col_map = {v: idx for idx, v in enumerate(row_vals) if v}
+                    break
+            
+            if col_map:
+                def first_present(m, *keys):
+                    for k in keys:
+                        if k in m: return m[k]
+                    return None
+
+                date_idx = first_present(col_map, "Posting Date", "Date")
+                code_idx = first_present(col_map, "Item No.", "Item Code")
+                receipt_idx = col_map.get("Receipt Quantity")
+                issue_idx = col_map.get("Issue Quantity")
+                type_idx = first_present(col_map, "Trans. Type", "Type", "Transaction Type")
+                whs_idx = first_present(col_map, "Whse Name", "Whse")
+                
+                cutoff = datetime.now(PHT) - timedelta(days=days)
+                found_tx = []
+                for row in reader[header_row_idx + 1:]:
+                    try:
+                        r_code = str(row[code_idx]).strip().upper() if code_idx is not None else ""
+                        if r_code != code: continue
+                        
+                        r_date_str = row[date_idx] if date_idx is not None else ""
+                        r_date = None
+                        if r_date_str:
+                            date_str = r_date_str.split()[0]
+                            if "/" in date_str:
+                                for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                                    try: r_date = datetime.strptime(date_str, fmt); break
+                                    except: continue
+                            elif "-" in date_str:
+                                for fmt in ("%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y"):
+                                    try: r_date = datetime.strptime(date_str, fmt); break
+                                    except: continue
+                        
+                        if r_date and r_date.replace(tzinfo=PHT) >= cutoff:
+                            r_qty = abs(float(row[receipt_idx])) if receipt_idx is not None and row[receipt_idx] else 0
+                            i_qty = abs(float(row[issue_idx])) if issue_idx is not None and row[issue_idx] else 0
+                            tx_type = row[type_idx] if type_idx is not None else "Unknown"
+                            tx_whs = row[whs_idx] if whs_idx is not None else "Unknown"
+                            found_tx.append(f"  • {r_date.strftime('%Y-%m-%d')} [{tx_type}]: Rec={r_qty:,.1f}, Iss={i_qty:,.1f} ({tx_whs})")
+                    except: continue
+                
+                if found_tx:
+                    movements_found = True
+                    # Show latest 10
+                    for tx in sorted(found_tx, reverse=True)[:10]:
+                        results.append(tx)
+                    if len(found_tx) > 10:
+                        results.append(f"  _...and {len(found_tx)-10} more movements_")
+                else:
+                    results.append("  _No movements found in transaction file for this period._")
+            else:
+                results.append("  ⚠️ Could not detect headers in transaction file.")
+        except Exception as e:
+            results.append(f"  ⚠️ Error querying Transaction file: {e}")
+        
+        results.append("")
+        if not sales_found and not movements_found:
+            results.append("🐢 *Conclusion:* This item is SLOW-MOVING.")
+        else:
+            results.append("✨ *Conclusion:* This item is ACTIVE.")
+
+        await msg.edit_text("\n".join(results), parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        logger.error(f"cmd_itemactivity error: {e}")
+        await msg.edit_text(f"❌ Diagnostic failed: {e}")
 
 
 # ── Free-text handler ─────────────────────────────────────────────────────────
@@ -4896,37 +5088,25 @@ async def send_automated_report(report_type: str):
         lines.append("\n" + ar_source_footer())
 
     elif report_type == "weekly_slowmoving":
-        # Slow moving items (30 days)
-        inv = store.inventory
-        by_item = group_inventory_by_item(inv)
-        items_with_stock = {k: v for k, v in by_item.items() if v["total"] > 0}
-        
         try:
-            conn = _get_portal_conn()
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT itemDescription AS product, SUM(CAST(quantity AS DECIMAL(12,3))) AS total_sold "
-                        "FROM sales_transactions WHERE postingDate >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) GROUP BY itemDescription"
-                    )
-                    sales_rows = cur.fetchall()
-            sales_map = {r["product"].strip().lower(): float(r["total_sold"]) for r in sales_rows if r["product"]}
+            # We use a dummy object to capture the text from _do_slowmoving
+            class Capture:
+                def __init__(self): self.text = ""
+                async def edit_message_text(self, text, **kwargs): self.text = text
             
-            slow = []
-            for item_no, data in items_with_stock.items():
-                if sales_map.get(data["desc"].strip().lower(), 0.0) == 0:
-                    slow.append(data)
+            cap = Capture()
+            # Use the unified logic (30 days, no segment)
+            await _do_slowmoving(cap, 30, segment="", show_all=False)
             
-            lines = [
-                "🐢 *Weekly Slow-Moving Spotlight*",
-                "_Items with stock but ZERO sales in 30 days._",
-                "",
-            ]
-            for item in sorted(slow, key=lambda x: x["total"], reverse=True)[:10]:
-                lines.append(f"• {item['desc']}: {int(item['total']):,} units")
-            
-            lines.append("\n" + inv_source_footer())
-        except:
+            # Format the output for the automated report
+            if cap.text:
+                # Replace the header to match automated report style
+                cap.text = cap.text.replace("🐢 *Slow-Moving Items (Last 30 Days)*", "🐢 *Weekly Slow-Moving Spotlight*")
+                lines = [cap.text]
+            else:
+                return
+        except Exception as e:
+            logger.error(f"Failed to generate weekly slowmoving report: {e}")
             return
 
     if not lines:
@@ -5024,6 +5204,7 @@ tg_app.add_handler(CommandHandler("low",        cmd_low))
 tg_app.add_handler(CommandHandler("lowstock",   cmd_lowstock))
 tg_app.add_handler(CommandHandler("warehouse",  cmd_warehouse))
 tg_app.add_handler(CommandHandler("slowmoving", cmd_slowmoving))
+tg_app.add_handler(CommandHandler("itemactivity", cmd_itemactivity))
 tg_app.add_handler(CallbackQueryHandler(cb_slowmoving_show_all, pattern=r"^slow_all\|"))
 tg_app.add_handler(CallbackQueryHandler(cb_warehouse_show_all, pattern=r"^whs_all\|"))
 tg_app.add_handler(CallbackQueryHandler(cb_expiring_show_all, pattern=r"^exp_all\|"))
