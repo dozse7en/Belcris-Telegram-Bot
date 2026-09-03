@@ -41,6 +41,7 @@ This file tracks all changes, fixes, lessons learned, and architectural decision
 
 ### v4.3 — 2026-09-03
 **Segment Support & Accuracy Improvements:**
+- **New Arrival Handling:** `/slowmoving` now automatically excludes new items that were first received within the analysis period (default 30 days). This prevents new stock from being incorrectly flagged as slow-moving before it has a chance to sell.
 - **Expiring Report Segment Filtering:** `/expiring [days] [segment]` now supports filtering by area/segment (e.g., `/expiring 30 Manila`). This allows sales offices to monitor their specific upcoming expirations.
 - **Slow-Moving Segment Filtering:** `/slowmoving [days] [segment]` now supports filtering by sales office. It filters both current inventory warehouses and Portal DB sales/transaction records by the segment keyword.
 - **Improved Accuracy:**

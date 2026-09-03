@@ -4640,6 +4640,7 @@ async def _do_slowmoving(update_or_query, days: int, segment: str = "", show_all
         # 3. Get Transactions from Google Drive Transaction file (via CSV export)
         movement_by_code = {}
         movement_by_desc = {}
+        first_receipt_by_code = {} # Track first receipt date to handle new items
         tx_count = 0
         try:
             # Request as CSV to bypass Excel formatting errors
@@ -4677,6 +4678,7 @@ async def _do_slowmoving(update_or_query, days: int, segment: str = "", show_all
             receipt_idx = col_map.get("Receipt Quantity")
             issue_idx = col_map.get("Issue Quantity")
             whs_idx = first_present(col_map, "Whse Name", "Whse")
+            type_idx = first_present(col_map, "TRANSACTION_TYPE", "Trans. Type", "Type")
             
             cutoff = datetime.now(PHT) - timedelta(days=days)
             for row in reader[header_row_idx + 1:]:
@@ -4718,6 +4720,14 @@ async def _do_slowmoving(update_or_query, days: int, segment: str = "", show_all
                             else: continue
                         else: continue
                     
+                    # Track first receipt date for each item
+                    tx_type = str(row[type_idx]).lower() if type_idx is not None else ""
+                    if "receipt" in tx_type or "production" in tx_type:
+                        if code_idx is not None and row[code_idx]:
+                            c = str(row[code_idx]).strip().upper()
+                            if c not in first_receipt_by_code or r_date < first_receipt_by_code[c]:
+                                first_receipt_by_code[c] = r_date
+
                     if r_date.replace(tzinfo=PHT) >= cutoff:
                         r_qty = abs(float(row[receipt_idx])) if receipt_idx is not None and row[receipt_idx] else 0
                         i_qty = abs(float(row[issue_idx])) if issue_idx is not None and row[issue_idx] else 0
@@ -4736,10 +4746,16 @@ async def _do_slowmoving(update_or_query, days: int, segment: str = "", show_all
 
         # 4. Identify slow movers (No Sales AND No Movement)
         slow_movers = []
+        cutoff_date = (datetime.now(PHT) - timedelta(days=days)).date()
         for item_no, data in items_with_stock.items():
             code = str(item_no).strip().upper()
             desc = " ".join(str(data["desc"]).lower().split())
             
+            # Exclude new arrivals (first receipt within the last N days)
+            first_rec = first_receipt_by_code.get(code)
+            if first_rec and first_rec.date() >= cutoff_date:
+                continue
+
             # Check Sales first (Primary)
             sold = sales_by_code.get(code, 0.0) or sales_by_desc.get(desc, 0.0)
             # Check Movement second
