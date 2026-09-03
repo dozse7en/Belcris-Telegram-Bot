@@ -4887,10 +4887,10 @@ async def cmd_itemactivity(update: Update, context: ContextTypes.DEFAULT_TYPE):
             inv_rows = [r for r in store.inventory if str(r["item_no"]).upper() == code]
         
         if inv_rows:
-            total_stock = sum(r["quantity"] for r in inv_rows)
+            total_stock = sum(r["in_stock"] for r in inv_rows)
             results.append(f"📦 *Current Stock:* {total_stock:,.1f}")
             for r in inv_rows:
-                results.append(f"  • {r['whs_name']} ({r.get('whs_code', 'N/A')}): {r['quantity']:,.1f}")
+                results.append(f"  • {r['whs_name']} ({r.get('whs_code', 'N/A')}): {r['in_stock']:,.1f}")
         else:
             results.append("📦 *Current Stock:* 0 (or not found in inventory)")
         results.append("")
