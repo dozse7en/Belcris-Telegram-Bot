@@ -5319,7 +5319,7 @@ def health():
     ar_src = store.ar_source_ts or "unknown"
     ap_src = store.ap_source_ts or "unknown"
     return (
-        f"Belcris Inventory Bot v3.0 — OK\n"
+        f"Belcris Inventory Bot v4.3 — OK\n"
         f"Last refresh: {ts}\n"
         f"Items: {inv}\n"
         f"Inventory source: {inv_src} PHT\n"
