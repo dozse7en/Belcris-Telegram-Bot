@@ -954,14 +954,33 @@ def group_inventory_by_item(records: list[dict]) -> dict:
 
 
 def search_inventory(query: str) -> list[dict]:
-    """Search inventory by keyword in description or item_no."""
+    """Search inventory by keyword in description or item_no with fuzzy fallback."""
     q = query.lower().strip()
     records = store.inventory
+    
+    # Level 1: Exact Item Code Match
     exact = [r for r in records if r["item_no"].lower() == q]
     if exact:
         return exact
+        
+    # Level 2: Substring Match (Item Code or Description)
     matches = [r for r in records if q in r["desc"].lower() or q in r["item_no"].lower()]
-    return matches
+    if matches:
+        return matches
+        
+    # Level 3: Fuzzy Match Fallback (only if no matches found)
+    # To keep it fast, we match against unique descriptions
+    unique_descs = list(set(r["desc"] for r in records))
+    # Find up to 5 close matches with a 0.6 similarity threshold
+    fuzzy_descs = difflib.get_close_matches(query.upper(), unique_descs, n=5, cutoff=0.6)
+    
+    if fuzzy_descs:
+        fuzzy_matches = []
+        for d in fuzzy_descs:
+            fuzzy_matches.extend([r for r in records if r["desc"] == d])
+        return fuzzy_matches
+        
+    return []
 
 
 def get_category_records(category: str) -> list[dict]:
@@ -5369,7 +5388,7 @@ def health():
     ar_src = store.ar_source_ts or "unknown"
     ap_src = store.ap_source_ts or "unknown"
     return (
-        f"Belcris Inventory Bot v4.5 — OK\n"
+        f"Belcris Inventory Bot v4.6 — OK\n"
         f"Last refresh: {ts}\n"
         f"Items: {inv}\n"
         f"Inventory source: {inv_src} PHT\n"

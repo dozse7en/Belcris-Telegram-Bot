@@ -39,6 +39,12 @@ This file tracks all changes, fixes, lessons learned, and architectural decision
 
 ## Version History
 
+### v4.6 — 2026-09-03
+**Smart Search (Fuzzy Matching):**
+- **Typos Handled**: Added a fuzzy matching layer to `/search` and `/check`. If an exact or substring match isn't found, the bot now looks for the closest matches in your active catalog.
+- **Smart Logic**: The bot prioritizes exact codes and keywords first to keep results fast and relevant, only falling back to fuzzy matching when necessary.
+- **Unique Suggestions**: Fuzzy matching targets unique item descriptions to avoid cluttering results with duplicate entries.
+
 ### v4.5 — 2026-09-03
 **Active Catalog Filter (Discontinued Item Handling):**
 - **2024 Active Catalog Filter**: The bot now automatically hides "discontinued" items. Any item with **zero stock** that was admitted **before 2024** is excluded from searches and reports.
