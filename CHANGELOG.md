@@ -39,6 +39,13 @@ This file tracks all changes, fixes, lessons learned, and architectural decision
 
 ## Version History
 
+### v4.4 — 2026-09-03
+**Catalog Visibility & Zero-Stock Support:**
+- **Full Catalog Loading**: The bot now loads all items from the inventory file, including those with zero stock (represented as `None` or `0` in SAP).
+- **Enhanced `/summary`**: The inventory summary now clearly distinguishes between "Unique Stocked Items" and "Out of Stock Catalog" items, providing a full view of your total SKUs.
+- **Improved `/search`**: Search results now include out-of-stock items labeled with a `❌ Out of Stock` tag, ensuring users can still find items you carry even if they are currently unavailable.
+- **Robust Loading**: Updated data parser to handle empty stock columns gracefully.
+
 ### v4.3 — 2026-09-03
 **Segment Support & Accuracy Improvements:**
 - **New Arrival Handling:** `/slowmoving` now automatically excludes new items that were first received within the analysis period (default 30 days). This prevents new stock from being incorrectly flagged as slow-moving before it has a chance to sell.

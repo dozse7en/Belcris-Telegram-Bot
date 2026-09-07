@@ -636,7 +636,8 @@ def load_inventory():
             continue
         whs_name = str(row[whs_name_col]).strip() if whs_name_col is not None and row[whs_name_col] else ""
         try:
-            qty = float(row[stock_col]) if stock_col is not None and row[stock_col] is not None else 0.0
+            val = row[stock_col] if stock_col is not None else None
+            qty = float(val) if val is not None else 0.0
         except:
             qty = 0.0
         exp_raw = row[exp_col] if exp_col is not None else None
@@ -1487,16 +1488,20 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         refresh_all_data()
         now_pht = datetime.now(PHT)
-        ts_date = store.last_refresh.strftime("%m/%d/%Y") if store.last_refresh else "—"
         ts_full = store.last_refresh.strftime("%m/%d/%Y %I:%M %p") if store.last_refresh else "—"
 
         inv = store.inventory
         total_records = len(inv)
-        unique_items  = len(set(r["item_no"] for r in inv))
+        
+        # Split into stocked and catalog (zero stock)
+        by_item = group_inventory_by_item(inv)
+        stocked_items = {k: v for k, v in by_item.items() if v["total"] > 0}
+        catalog_items = {k: v for k, v in by_item.items() if v["total"] <= 0}
+        
         warehouses    = len(set(r["whs_name"] for r in inv if r["whs_name"]))
         total_qty     = int(sum(r["in_stock"] for r in inv))
 
-        # Expiry alerts — exp_date is always a date object (parsed from batch code)
+        # Expiry alerts
         expired_items = set()
         exp_30_items  = set()
         exp_90_items  = set()
@@ -1508,9 +1513,9 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
             days_left = (exp_date - today_pht).days
             if r["in_stock"] > 0 and days_left < 0:
                 expired_items.add(r["item_no"])
-            elif days_left <= 30:
+            elif r["in_stock"] > 0 and days_left <= 30:
                 exp_30_items.add(r["item_no"])
-            elif days_left <= 90:
+            elif r["in_stock"] > 0 and days_left <= 90:
                 exp_90_items.add(r["item_no"])
 
         src_ts = store.inventory_source_ts or ts_full
@@ -1520,13 +1525,14 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏪 *Inventory Summary*",
             f"_As of {src_ts}_",
             f"",
-            f"Total Records: {total_records:,}",
-            f"Unique Items: {unique_items:,}",
+            f"Unique Stocked Items: *{len(stocked_items):,}*",
+            f"Out of Stock Catalog: *{len(catalog_items):,}*",
+            f"Total Unique SKUs: *{len(by_item):,}*",
             f"Warehouses: {warehouses}",
             f"Total Quantity: {total_qty:,}",
             f"",
-            f"*Expiry Alerts:*",
-            f"🔴 Expired (still in stock): {len(expired_items)} items",
+            f"*Expiry Alerts (Stocked Items):*",
+            f"🔴 Expired: {len(expired_items)} items",
             f"🟠 Expiring ≤30 days: {len(exp_30_items)} items",
             f"🟡 Expiring ≤90 days: {len(exp_90_items)} items",
             f"",
@@ -1681,8 +1687,12 @@ async def _do_search(update: Update, query: str):
     for item in items:
         qty = int(item["total"])
         desc_safe = item['desc'].replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '')
+        
+        # Label out-of-stock items
+        stock_label = f"{qty:,}" if qty > 0 else "❌ Out of Stock"
+        
         # Item code in monospace so desktop users can click-to-copy
-        line = f"• `{item['item_no']}` — {desc_safe}: {qty:,}\n"
+        line = f"• `{item['item_no']}` — {desc_safe}: {stock_label}\n"
         if len(chunk) + len(line) > 3800:
             try:
                 await update.message.reply_text(chunk.rstrip(), parse_mode=ParseMode.MARKDOWN)
@@ -5319,7 +5329,7 @@ def health():
     ar_src = store.ar_source_ts or "unknown"
     ap_src = store.ap_source_ts or "unknown"
     return (
-        f"Belcris Inventory Bot v4.3 — OK\n"
+        f"Belcris Inventory Bot v4.4 — OK\n"
         f"Last refresh: {ts}\n"
         f"Items: {inv}\n"
         f"Inventory source: {inv_src} PHT\n"
