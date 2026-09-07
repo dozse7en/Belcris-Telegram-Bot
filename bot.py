@@ -500,6 +500,7 @@ class DataStore:
     def __init__(self):
         self.inventory: list[dict] = []
         self.component_inventory: list[dict] = []  # Component Warehouse rows (PRD use)
+        self.discontinued_count: int = 0
         self.ar_rows: list[dict] = []
         self.ap_rows: list[dict] = []
         self.last_refresh: datetime | None = None
@@ -627,10 +628,16 @@ def load_inventory():
     batch_col    = col("Batch")
     exp_col      = col("Expiration Date")
     status_col   = col("Status")
+    adm_col      = col("Admission Date")
 
     excluded = 0
+    discontinued = 0
     records = []
     component_records = []
+    
+    # Active catalog threshold: 2024
+    ACTIVE_YEAR_THRESHOLD = 2024
+    
     for row in rows[1:]:
         if not row or row[0] is None:
             continue
@@ -640,10 +647,23 @@ def load_inventory():
             qty = float(val) if val is not None else 0.0
         except:
             qty = 0.0
+        
+        adm_raw = row[adm_col] if adm_col is not None else None
+        adm_year = 0
+        if adm_raw:
+            try:
+                # Parse year from Admission Date (MM/DD/YY or MM/DD/YYYY)
+                dt_str = str(adm_raw).split()[0]
+                year_str = dt_str.split('/')[-1]
+                adm_year = int(year_str)
+                if adm_year < 100: adm_year += 2000
+            except: pass
+            
         exp_raw = row[exp_col] if exp_col is not None else None
         batch_str = str(row[batch_col]).strip() if batch_col is not None and row[batch_col] else ""
         exp_date = parse_exp_date(exp_raw, batch_str)
         status = str(row[status_col]).strip() if status_col is not None and row[status_col] else ""
+        
         rec = {
             "item_no":   str(row[item_no_col]).strip() if item_no_col is not None and row[item_no_col] else "",
             "desc":      str(row[desc_col]).strip() if desc_col is not None and row[desc_col] else "",
@@ -653,13 +673,24 @@ def load_inventory():
             "batch":     batch_str,
             "exp_date":  exp_date,
             "status":    status,
+            "adm_year":  adm_year,
         }
+        
+        # Filter logic:
+        # 1. Component Warehouse is always kept
+        # 2. On-hold warehouses are excluded
+        # 3. Discontinued filter: Zero stock AND Admission Year < 2024
         if whs_name == "Component Warehouse":
             component_records.append(rec)
         elif whs_name in ON_HOLD_WAREHOUSES:
             excluded += 1
+        elif qty <= 0 and adm_year > 0 and adm_year < ACTIVE_YEAR_THRESHOLD:
+            discontinued += 1
         else:
             records.append(rec)
+
+    store.discontinued_count = discontinued
+    logger.info(f"Excluded {excluded} rows (on-hold) | Filtered {discontinued} rows (discontinued/pre-2024 zero stock)")
 
     logger.info(f"Excluded {excluded} rows from on-hold warehouses (excl. Component Warehouse)")
     logger.info(f"Loaded {len(records)} records | {len(set(r['item_no'] for r in records))} items | {len(set(r['whs_name'] for r in records if r['whs_name']))} warehouses")
@@ -1556,19 +1587,23 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     now_pht = datetime.now(PHT)
     inv = store.inventory
-    total_records = len(inv)
-    unique_items  = len(set(r["item_no"] for r in inv))
+    
+    # Split into stocked and catalog
+    by_item = group_inventory_by_item(inv)
+    stocked_items = {k: v for k, v in by_item.items() if v["total"] > 0}
+    catalog_items = {k: v for k, v in by_item.items() if v["total"] <= 0}
+    
     warehouses    = len(set(r["whs_name"] for r in inv if r["whs_name"]))
     total_qty     = int(sum(r["in_stock"] for r in inv))
 
-    # Category breakdown
+    # Category breakdown (Stocked only)
     cat_totals: dict[str, int] = {}
     for cat, keywords in CATEGORY_KEYWORDS.items():
         total = sum(r["in_stock"] for r in inv if any(kw in r["desc"].lower() for kw in keywords))
         if total > 0:
             cat_totals[cat] = int(total)
 
-    # Expiry alerts — exp_date is always a date object (parsed from batch code)
+    # Expiry alerts (Stocked only)
     expired_items = set()
     exp_30_items  = set()
     exp_90_items  = set()
@@ -1578,29 +1613,32 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if exp_date is None:
             continue
         days_left = (exp_date - today_pht).days
-        if r["in_stock"] > 0 and days_left < 0:
-            expired_items.add(r["item_no"])
-        elif days_left <= 30:
-            exp_30_items.add(r["item_no"])
-        elif days_left <= 90:
-            exp_90_items.add(r["item_no"])
+        if r["in_stock"] > 0:
+            if days_left < 0:
+                expired_items.add(r["item_no"])
+            elif days_left <= 30:
+                exp_30_items.add(r["item_no"])
+            elif days_left <= 90:
+                exp_90_items.add(r["item_no"])
 
     lines = [
         "🏪 *Inventory Snapshot*\n",
-        f"Total Records: {total_records:,}",
-        f"Unique Items: {unique_items:,}",
+        f"Unique Stocked Items: *{len(stocked_items):,}*",
+        f"Active Out of Stock: *{len(catalog_items):,}*",
+        f"Total Active SKUs: *{len(by_item):,}*",
+        f"Discontinued (Pre-2024): *{store.discontinued_count:,}*",
         f"Warehouses: {warehouses}",
         f"Total Quantity: {total_qty:,}",
         "",
-        "*Category Breakdown:*",
+        "*Category Breakdown (Stocked):*",
     ]
     for cat, qty in sorted(cat_totals.items(), key=lambda x: x[1], reverse=True):
         lines.append(f"• {cat}: {qty:,}")
 
     lines += [
         "",
-        "*Expiry Alerts:*",
-        f"🔴 Expired (in stock): {len(expired_items)} items",
+        "*Expiry Alerts (Stocked):*",
+        f"🔴 Expired: {len(expired_items)} items",
         f"🟠 Expiring ≤30 days: {len(exp_30_items)} items",
         f"🟡 Expiring ≤90 days: {len(exp_90_items)} items",
         "",
@@ -5089,21 +5127,23 @@ async def send_automated_report(report_type: str):
         # Simplified version of cmd_summary for executive overview
         inv = store.inventory
         total_qty = int(sum(r["in_stock"] for r in inv))
-        unique_items = len(set(r["item_no"] for r in inv))
         
-        # Low stock items
-        low_stock = []
         by_item = group_inventory_by_item(inv)
-        for k, v in by_item.items():
+        stocked_items = {k: v for k, v in by_item.items() if v["total"] > 0}
+        
+        # Low stock items (Stocked but low)
+        low_stock = []
+        for k, v in stocked_items.items():
             if v["total"] < 500: # Standard threshold
                 low_stock.append(v)
         
         lines = [
             "☀️ *Daily Inventory Report*",
             f"Total Stock: {total_qty:,} units",
-            f"Unique Items: {unique_items:,}",
+            f"Unique Stocked Items: {len(stocked_items):,}",
             "",
             f"⚠️ *Low Stock Alerts (<500kg):* {len(low_stock)} items",
+            f"_(Filtered {store.discontinued_count:,} discontinued items)_",
         ]
         if low_stock:
             for item in sorted(low_stock, key=lambda x: x["total"])[:5]:
@@ -5329,7 +5369,7 @@ def health():
     ar_src = store.ar_source_ts or "unknown"
     ap_src = store.ap_source_ts or "unknown"
     return (
-        f"Belcris Inventory Bot v4.4 — OK\n"
+        f"Belcris Inventory Bot v4.5 — OK\n"
         f"Last refresh: {ts}\n"
         f"Items: {inv}\n"
         f"Inventory source: {inv_src} PHT\n"

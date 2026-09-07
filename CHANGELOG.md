@@ -39,6 +39,12 @@ This file tracks all changes, fixes, lessons learned, and architectural decision
 
 ## Version History
 
+### v4.5 — 2026-09-03
+**Active Catalog Filter (Discontinued Item Handling):**
+- **2024 Active Catalog Filter**: The bot now automatically hides "discontinued" items. Any item with **zero stock** that was admitted **before 2024** is excluded from searches and reports.
+- **Cleaner Results**: This filter removes approximately 34,000 old/dead SKUs, making your search results and reports much more relevant.
+- **Updated Metrics**: The `/summary` and daily reports now explicitly show the number of "Discontinued Items" filtered out.
+
 ### v4.4 — 2026-09-03
 **Catalog Visibility & Zero-Stock Support:**
 - **Full Catalog Loading**: The bot now loads all items from the inventory file, including those with zero stock (represented as `None` or `0` in SAP).
