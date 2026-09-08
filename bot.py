@@ -826,8 +826,8 @@ def load_bp_master():
         if not row or code_col is None or not row[code_col]:
             continue
         code = str(row[code_col]).strip().upper()
-        # Filter: Only include BP codes starting with A or S
-        if not (code.startswith('A') or code.startswith('S')):
+        # Filter: Exclude BP codes starting with A or S
+        if code.startswith('A') or code.startswith('S'):
             continue
             
         master[code] = {

@@ -39,6 +39,10 @@ This file tracks all changes, fixes, lessons learned, and architectural decision
 
 ## Version History
 
+### v4.7.3 — 2026-09-03
+**Business Partner Filtering (Exclusion):**
+- **Code Filter**: Updated the filter to **exclude** Business Partners whose codes start with **"A"** or **"S"**. All other codes remain visible.
+
 ### v4.7.2 — 2026-09-03
 **Business Partner Filtering:**
 - **Code Filter**: Added a filter to only include Business Partners whose codes start with **"A"** or **"S"**. This helps focus the bot on specific partner categories.
