@@ -825,7 +825,11 @@ def load_bp_master():
     for row in rows[1:]:
         if not row or code_col is None or not row[code_col]:
             continue
-        code = str(row[code_col]).strip()
+        code = str(row[code_col]).strip().upper()
+        # Filter: Only include BP codes starting with A or S
+        if not (code.startswith('A') or code.startswith('S')):
+            continue
+            
         master[code] = {
             "code":     code,
             "name":     str(row[name_col]).strip() if name_col is not None and row[name_col] else "",
@@ -5555,7 +5559,7 @@ def health():
     ap_src = store.ap_source_ts or "unknown"
     bp_src = store.bp_master_source_ts or "unknown"
     return (
-        f"Belcris Inventory Bot v4.7 — OK\n"
+        f"Belcris Inventory Bot v4.7.2 — OK\n"
         f"Last refresh: {ts}\n"
         f"Items: {inv}\n"
         f"Inventory source: {inv_src} PHT\n"

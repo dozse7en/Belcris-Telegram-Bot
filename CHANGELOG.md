@@ -39,6 +39,15 @@ This file tracks all changes, fixes, lessons learned, and architectural decision
 
 ## Version History
 
+### v4.7.2 — 2026-09-03
+**Business Partner Filtering:**
+- **Code Filter**: Added a filter to only include Business Partners whose codes start with **"A"** or **"S"**. This helps focus the bot on specific partner categories.
+
+### v4.7.1 — 2026-09-03
+**Bug Fixes & Search Improvements:**
+- **Fuzzy AR Search**: Updated `/arsearch` to correctly use the Master List and provide typo suggestions.
+- **Balance Indicators**: Added a `💰` icon in search results to highlight clients with active balances.
+
 ### v4.7 — 2026-09-03
 **Business Partner Master Integration:**
 - **Master Directory Support**: The bot now loads the full **Business Partner Master List** (70,000+ customers).
