@@ -89,6 +89,7 @@ INVENTORY_FILE_ID   = os.environ.get("INVENTORY_FILE_ID",   "1_qBGc6JV2OGoeISDFl
 TRANSACTION_FILE_ID = os.environ.get("TRANSACTION_FILE_ID", "1TbI6JzPlfsLdX_rcxI7S2rHzR3FY_2MI")
 AR_FILE_ID          = os.environ.get("AR_FILE_ID",          "1nmr-7YLCZe2dPXkAplseUxMGrlhaWlTS")
 AP_FILE_ID          = os.environ.get("AP_FILE_ID",          "1ejtfkY-Y72LgXRPdLq5Z-cQZk3uD8IwO")
+BP_MASTER_FILE_ID   = os.environ.get("BP_MASTER_FILE_ID",   "1pRFH7toex76UBNr68UtGG97xS3TeH4Na")
 
 # Ham Portal DB (read-only sales queries)
 PORTAL_DB_URL = os.environ.get("PORTAL_DB_URL", "")  # mysql://user:pass@host:port/db?ssl=...
@@ -503,11 +504,13 @@ class DataStore:
         self.discontinued_count: int = 0
         self.ar_rows: list[dict] = []
         self.ap_rows: list[dict] = []
+        self.bp_master: dict[str, dict] = {} # CardCode -> Master Details
         self.last_refresh: datetime | None = None
         # Source file timestamps (from Google Drive Last-Modified headers)
         self.inventory_source_ts: str = ""
         self.ar_source_ts: str = ""
         self.ap_source_ts: str = ""
+        self.bp_master_source_ts: str = ""
         self._lock = threading.Lock()
 
 store = DataStore()
@@ -845,7 +848,7 @@ def load_ap():
 
 
 def refresh_all_data():
-    """Reload all three data sources and update source timestamps."""
+    """Reload all data sources and update source timestamps."""
     try:
         with store._lock:
             store.inventory_source_ts = get_drive_file_modified_ts(INVENTORY_FILE_ID)
@@ -856,6 +859,9 @@ def refresh_all_data():
 
             store.ap_source_ts = get_drive_file_modified_ts(AP_FILE_ID)
             store.ap_rows = load_ap()
+
+            store.bp_master_source_ts = get_drive_file_modified_ts(BP_MASTER_FILE_ID, is_sheets=True)
+            store.bp_master = load_bp_master()
 
             store.last_refresh = datetime.now(PHT)
     except Exception as e:
@@ -3092,15 +3098,24 @@ async def cmd_ar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     q = query.lower()
-    # Exact code match takes priority (e.g. /client CMNL00013)
-    code_matches = [r for r in store.ar_rows if r["card_code"].lower() == q]
-    if code_matches:
-        matches = code_matches
-    else:
-        matches = [r for r in store.ar_rows if q in r["card_name"].lower() or q in r["card_code"].lower()]
-    if not matches:
-        all_clients = list(set(r["card_name"] for r in store.ar_rows))
-        close = difflib.get_close_matches(query, all_clients, n=3, cutoff=0.5)
+    
+    # 1. Collect all matching CardCodes from both AR and Master
+    matched_codes = set()
+    
+    # Check AR records
+    for r in store.ar_rows:
+        if q == r["card_code"].lower() or q in r["card_name"].lower() or q in r["card_code"].lower():
+            matched_codes.add(r["card_code"])
+            
+    # Check Master records (for zero-balance clients)
+    for code, m in store.bp_master.items():
+        if q == code.lower() or q in m["name"].lower() or q in code.lower():
+            matched_codes.add(code)
+            
+    if not matched_codes:
+        # Fuzzy search on master names
+        all_names = [m["name"] for m in store.bp_master.values()]
+        close = difflib.get_close_matches(query.upper(), all_names, n=3, cutoff=0.6)
         if close:
             await update.message.reply_text(
                 f"❓ No exact match for *{query}*. Did you mean:\n" +
@@ -3108,24 +3123,34 @@ async def cmd_ar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:
-            await update.message.reply_text(f"❌ No AR records for *{query}*.", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"❌ No customer records found for *{query}*.", parse_mode=ParseMode.MARKDOWN)
         return
 
     by_client: dict[str, dict] = {}
-    for r in matches:
-        k = r["card_name"]
-        if k not in by_client:
-            by_client[k] = {
-                "name": k,
-                "code": r["card_code"],
-                "agent": r["agent"],
-                "terms": r["terms"],
-                "segment": r.get("area", "") or "",
-                "total": 0.0,
-                "sis": [],
-            }
-        by_client[k]["total"] += r["balance"]
-        by_client[k]["sis"].append(r)
+    for code in matched_codes:
+        # Get Master info
+        m = store.bp_master.get(code, {})
+        
+        # Get AR records for this code
+        sis = [r for r in store.ar_rows if r["card_code"] == code]
+        total = sum(si["balance"] for si in sis)
+        
+        # Use Master name if available, else first AR name
+        name = m.get("name") or (sis[0]["card_name"] if sis else code)
+        
+        by_client[code] = {
+            "name": name,
+            "code": code,
+            "agent": m.get("sales_rep") or (sis[0]["agent"] if sis else ""),
+            "terms": m.get("terms") or (sis[0]["terms"] if sis else ""),
+            "segment": m.get("segment") or (sis[0].get("area", "") if sis else ""),
+            "address": m.get("address", ""),
+            "mobile": m.get("mobile", ""),
+            "email": m.get("email", ""),
+            "contact": m.get("contact", ""),
+            "total": total,
+            "sis": sis,
+        }
 
     if len(by_client) == 1:
         # Rich single-client detail view
@@ -3179,13 +3204,28 @@ async def _do_ar_client_detail(update, client: dict):
             return f"🔴 {days_due}d overdue"
 
     lines = [
-        f"🗂 {client['name']}",
+        f"🗂 <b>{client['name']}</b>",
         f"Code: <code>{client['code']}</code> | Agent: {client['agent'] or '—'}",
         f"Terms: {client['terms'] or '—'} | Area: {client.get('segment', '') or '—'}",
-        f"Total Outstanding: {fmt_peso(total)} ({si_count} SIs)",
-        "",
-        "Aging Breakdown:",
     ]
+    
+    # Add Contact Info if available
+    contact_parts = []
+    if client.get("mobile"): contact_parts.append(f"📞 {client['mobile']}")
+    if client.get("email"): contact_parts.append(f"✉️ {client['email']}")
+    if contact_parts:
+        lines.append(" | ".join(contact_parts))
+    if client.get("address"):
+        lines.append(f"📍 {client['address']}")
+    if client.get("contact"):
+        lines.append(f"👤 Contact: {client['contact']}")
+        
+    status_emoji = "🔴" if total > 0 else "✅"
+    lines.append(f"{status_emoji} Total Outstanding: <b>{fmt_peso(total)}</b> ({si_count} SIs)")
+    lines.append("")
+    
+    if total > 0:
+        lines.append("Aging Breakdown:")
     for bucket, amount in buckets.items():
         if amount > 0:
             lines.append(f"  • {bucket}: {fmt_peso(amount)}")
@@ -3615,38 +3655,100 @@ async def cmd_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_arsearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _access_gate(update, context):
         return
-    """Search clients by name in AR."""
+    """Search clients by name in the Master BP List."""
     keyword = " ".join(context.args).strip() if context.args else ""
     if not keyword:
         await update.message.reply_text("Usage: `/arsearch <keyword>`\nExample: `/arsearch jollibee`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    if not store.ar_rows:
-        await update.message.reply_text("⚠️ AR data not loaded yet. Try `/refresh`.", parse_mode=ParseMode.MARKDOWN)
+    if not store.bp_master:
+        await update.message.reply_text("⚠️ Master data not loaded yet. Try `/refresh`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     q = keyword.lower()
-    matches = [r for r in store.ar_rows if q in r["card_name"].lower() or q in r["card_code"].lower()]
+    matches = []
+    for code, m in store.bp_master.items():
+        if q in m["name"].lower() or q in code.lower():
+            matches.append(m)
+            
     if not matches:
-        await update.message.reply_text(f"❌ No clients matching *{keyword}*.", parse_mode=ParseMode.MARKDOWN)
+        # Fallback to fuzzy search
+        all_names = [m["name"] for m in store.bp_master.values()]
+        close = difflib.get_close_matches(keyword.upper(), all_names, n=5, cutoff=0.6)
+        if close:
+            await update.message.reply_text(
+                f"❓ No exact match for *{keyword}*. Did you mean:\n" +
+                "\n".join(f"• {c}" for c in close),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text(f"❌ No clients matching *{keyword}*.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    by_client: dict[str, dict] = {}
-    for r in matches:
-        k = r["card_name"]
-        if k not in by_client:
-            by_client[k] = {"name": k, "code": r["card_code"], "total": 0.0, "agent": r["agent"]}
-        by_client[k]["total"] += r["balance"]
+    lines = [f"🔎 Client Master Search: {keyword} — {len(matches)} client(s)\n"]
+    for m in sorted(matches, key=lambda x: x["name"])[:20]:
+        code = m["code"]
+        # Check if they have a balance
+        bal = sum(r["balance"] for r in store.ar_rows if r["card_code"] == code)
+        bal_str = f" | Balance: {fmt_peso(bal)}" if bal > 0 else ""
+        lines.append(f"\u2022 <code>{code}</code> {m['name']}{bal_str}")
+        lines.append(f"  Area: {m['segment'] or '—'} | Rep: {m['sales_rep'] or '—'}")
 
-    lines = [f"🔎 AR Search: {keyword} — {len(by_client)} client(s)\n"]
-    for c in sorted(by_client.values(), key=lambda x: x["total"], reverse=True)[:20]:
-        lines.append(f"\u2022 <code>{c['code']}</code> {c['name']}")
-        lines.append(f"  Balance: {fmt_peso(c['total'])} | Agent: {c['agent'] or '—'}")
+    if len(matches) > 20:
+        lines.append(f"\n_...and {len(matches)-20} more clients found._")
 
-    if len(by_client) > 20:
-        lines.append(f"Showing 20 of {len(by_client)} clients.")
+    lines.append(f"\nTip: Use `/ar <code>` for full details.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-    lines.append(f"\n{ar_source_footer()}")
+
+async def cmd_compliance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/compliance — List customers with expiring BIR/Mayor's/SEC permits (next 30 days)."""
+    if not await _access_gate(update, context):
+        return
+    if not store.bp_master:
+        await update.message.reply_text("⚠️ Master data not loaded yet. Try `/refresh`.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    days = 30
+    if context.args:
+        try: days = int(context.args[0])
+        except: pass
+
+    today = datetime.now(PHT).date()
+    threshold = today + timedelta(days=days)
+    
+    expiring = []
+    for code, m in store.bp_master.items():
+        issues = []
+        for key, label in [("bir_exp", "BIR 2303"), ("mayor_exp", "Mayor's Permit"), ("sec_exp", "SEC/DTI")]:
+            val = m.get(key)
+            if val and isinstance(val, (datetime, date)):
+                d = val if isinstance(val, date) else val.date()
+                if d <= threshold:
+                    days_left = (d - today).days
+                    issues.append(f"{label}: {fmt_date(d)} ({days_left}d)")
+        
+        if issues:
+            expiring.append({
+                "name": m["name"],
+                "code": code,
+                "issues": issues
+            })
+
+    if not expiring:
+        await update.message.reply_text(f"✅ No permits expiring within {days} days.")
+        return
+
+    lines = [f"📋 <b>Compliance Alert: Expiring Permits ({days} days)</b>\n"]
+    for item in expiring[:20]:
+        lines.append(f"• <b>{item['name']}</b> (<code>{item['code']}</code>)")
+        for issue in item["issues"]:
+            lines.append(f"  └ {issue}")
+        lines.append("")
+
+    if len(expiring) > 20:
+        lines.append(f"_...and {len(expiring)-20} more customers._")
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -5334,6 +5436,7 @@ tg_app.add_handler(CommandHandler("area",       cmd_area))
 tg_app.add_handler(CommandHandler("agent",      cmd_agent))
 tg_app.add_handler(CommandHandler("arsearch",   cmd_arsearch))
 tg_app.add_handler(CommandHandler("arrefresh",  cmd_arrefresh))
+tg_app.add_handler(CommandHandler("compliance", cmd_compliance))
 
 # AP
 tg_app.add_handler(CommandHandler("apsummary",  cmd_apsummary))
@@ -5387,13 +5490,15 @@ def health():
     inv_src = store.inventory_source_ts or "unknown"
     ar_src = store.ar_source_ts or "unknown"
     ap_src = store.ap_source_ts or "unknown"
+    bp_src = store.bp_master_source_ts or "unknown"
     return (
-        f"Belcris Inventory Bot v4.6 — OK\n"
+        f"Belcris Inventory Bot v4.7 — OK\n"
         f"Last refresh: {ts}\n"
         f"Items: {inv}\n"
         f"Inventory source: {inv_src} PHT\n"
         f"AR source: {ar_src} PHT\n"
-        f"AP source: {ap_src} PHT"
+        f"AP source: {ap_src} PHT\n"
+        f"BP Master source: {bp_src} PHT"
     ), 200
 
 

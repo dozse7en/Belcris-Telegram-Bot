@@ -39,6 +39,14 @@ This file tracks all changes, fixes, lessons learned, and architectural decision
 
 ## Version History
 
+### v4.7 — 2026-09-03
+**Business Partner Master Integration:**
+- **Master Directory Support**: The bot now loads the full **Business Partner Master List** (70,000+ customers).
+- **Enhanced `/client` / `/ar`**: Search results now include **Phone Numbers, Physical Address, and Email** directly in the message.
+- **Zero-Balance Search**: You can now search for any customer in your system, even if they have a zero balance. The bot will confirm they are "Fully Paid" instead of saying "No results."
+- **New Command `/compliance`**: Track expiring BIR 2303, Mayor's Permits, and SEC/DTI permits for all customers in the next 30 days.
+- **Fuzzy Search for Clients**: Added fuzzy matching to `/arsearch` to help find customers even with spelling mistakes.
+
 ### v4.6 — 2026-09-03
 **Smart Search (Fuzzy Matching):**
 - **Typos Handled**: Added a fuzzy matching layer to `/search` and `/check`. If an exact or substring match isn't found, the bot now looks for the closest matches in your active catalog.
