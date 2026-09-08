@@ -785,6 +785,67 @@ def load_ar():
     return records
 
 
+def load_bp_master():
+    """Load the Business Partner Master List (Full catalog of customers)."""
+    logger.info("Refreshing BP Master data from Google Drive...")
+    try:
+        data = download_gdrive_file(BP_MASTER_FILE_ID)
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(min_row=1, values_only=True))
+        wb.close()
+    except Exception as e:
+        logger.error(f"Failed to load BP Master: {e}")
+        return {}
+
+    if not rows:
+        return {}
+
+    header = [str(h).strip() if h else "" for h in rows[0]]
+    def col(name):
+        try: return header.index(name)
+        except ValueError: return None
+
+    code_col    = col("BP Code")
+    name_col    = col("BP Name")
+    addr_col    = col("Bill To Address")
+    seg_col     = col("Segment")
+    sales_col   = col("Sales Employee Code")
+    terms_col   = col("Payment Terms Code")
+    kind_col    = col("Kind Of Business")
+    bir_col     = col("Customer BIR 2303 Expiry Date")
+    mayor_col   = col("Customer Mayors Permit Expiry")
+    sec_col     = col("Customer SEC/DTI Expiry")
+    contact_col = col("Contact Person")
+    tel_col     = col("Telephone 1")
+    mob_col     = col("Mobile Phone")
+    email_col   = col("E-Mail")
+
+    master = {}
+    for row in rows[1:]:
+        if not row or code_col is None or not row[code_col]:
+            continue
+        code = str(row[code_col]).strip()
+        master[code] = {
+            "code":     code,
+            "name":     str(row[name_col]).strip() if name_col is not None and row[name_col] else "",
+            "address":  str(row[addr_col]).strip() if addr_col is not None and row[addr_col] else "",
+            "segment":  str(row[seg_col]).strip() if seg_col is not None and row[seg_col] else "",
+            "sales_rep": str(row[sales_col]).strip() if sales_col is not None and row[sales_col] else "",
+            "terms":    str(row[terms_col]).strip() if terms_col is not None and row[terms_col] else "",
+            "kind":     str(row[kind_col]).strip() if kind_col is not None and row[kind_col] else "",
+            "bir_exp":   row[bir_col] if bir_col is not None else None,
+            "mayor_exp": row[mayor_col] if mayor_col is not None else None,
+            "sec_exp":   row[sec_col] if sec_col is not None else None,
+            "contact":  str(row[contact_col]).strip() if contact_col is not None and row[contact_col] else "",
+            "tel":      str(row[tel_col]).strip() if tel_col is not None and row[tel_col] else "",
+            "mobile":   str(row[mob_col]).strip() if mob_col is not None and row[mob_col] else "",
+            "email":    str(row[email_col]).strip() if email_col is not None and row[email_col] else "",
+        }
+    logger.info(f"BP Master loaded: {len(master)} entries")
+    return master
+
+
 def load_ap():
     logger.info("Refreshing AP (Unreleased Payments) data from Google Drive...")
     data = download_gdrive_file(AP_FILE_ID)
@@ -869,11 +930,13 @@ def refresh_all_data():
 
 
 def refresh_ar_only():
-    """Reload only AR data."""
+    """Reload only AR and BP Master data."""
     try:
         with store._lock:
             store.ar_source_ts = get_drive_file_modified_ts(AR_FILE_ID, is_sheets=True)
             store.ar_rows = load_ar()
+            store.bp_master_source_ts = get_drive_file_modified_ts(BP_MASTER_FILE_ID, is_sheets=True)
+            store.bp_master = load_bp_master()
             store.last_refresh = datetime.now(PHT)
     except Exception as e:
         logger.error(f"Error loading AR data: {e}")
